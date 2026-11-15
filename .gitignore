@@ -1,0 +1,7 @@
+/core/target/
+/app/.build/
+/build/
+/judge/out/
+*.dmg
+.DS_Store
+__pycache__/

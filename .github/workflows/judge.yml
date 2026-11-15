@@ -1,0 +1,104 @@
+name: Judge
+
+on:
+  workflow_dispatch:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  freeze:
+    # The judge only stays honest if it never changes in the same PR as the code it judges.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Judge and code never change together
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          changed=$(git diff --name-only "$BASE...$HEAD")
+          if printf '%s\n' "$changed" | grep -qE '^(judge/|\.github/workflows/judge\.yml$)' &&
+             printf '%s\n' "$changed" | grep -qE '^(core|app)/'; then
+            echo "::error::This PR changes the judge and core/ or app/ together. Split it into two PRs."
+            exit 1
+          fi
+
+  shed:
+    runs-on: macos-15 # arm64
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build Shed at 19a2339
+        env:
+          SHED_SHA: 19a2339a595f1c37d9f70d81c8f2615de46a2db2
+        run: |
+          src="$RUNNER_TEMP/shed"
+          git init -q "$src"
+          git -C "$src" fetch -q --depth 1 https://github.com/DerrickDaVinci/shed "$SHED_SHA"
+          git -C "$src" checkout -q --detach FETCH_HEAD
+          (cd "$src/src-tauri" && cargo build --release --locked)
+          mkdir -p "$HOME/judge-bin"
+          cp "$src/src-tauri/target/release/shed" "$HOME/judge-bin/shed"
+          rm -rf "$src" # give the disk back before world.py sizes the world
+      - name: Build the world
+        run: python3 -I judge/world.py
+      - name: Run Shed
+        run: python3 -I judge/shed.py --bin "$HOME/judge-bin/shed" --empty-trash
+      - name: Upload Shed report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: shed-report
+          path: |
+            judge/out/shed.json
+            judge/out/truth.json
+          if-no-files-found: warn
+
+  headroom:
+    needs: shed
+    if: ${{ !cancelled() }}
+    runs-on: macos-15 # arm64, a fresh runner: nothing left over from Shed
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download Shed report
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: shed-report
+          path: ${{ runner.temp }}/shed
+      - name: Build Headroom
+        run: |
+          if [ -d core ] && [ -d app ] && [ -f scripts/bundle.sh ]; then
+            if bash scripts/bundle.sh; then
+              bin=$(find "$PWD" -path '*/Headroom.app/Contents/MacOS/Headroom' -type f -not -path "$PWD/judge/*" | head -n 1)
+              echo "HEADROOM_BIN=$bin" >> "$GITHUB_ENV"
+            else
+              echo "::error::scripts/bundle.sh failed; the judge reports the binary as missing"
+            fi
+          else
+            echo "core/, app/ or scripts/bundle.sh not in this commit yet: the binary is missing"
+          fi
+      - name: Build the world
+        run: python3 -I judge/world.py --ratio-from "$RUNNER_TEMP/shed/truth.json"
+      - name: Judge Headroom
+        if: ${{ !cancelled() }} # still report (all FAIL) when the world build broke
+        run: python3 -I judge/run.py --bin "${HEADROOM_BIN:-}" --shed-report "$RUNNER_TEMP/shed/shed.json"
+      - name: Upload judge report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: judge-report
+          path: judge/out/
+          if-no-files-found: warn
