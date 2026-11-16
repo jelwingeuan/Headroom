@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15 # arm64
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust components
+        run: rustup component add rustfmt clippy
+      - name: Format
+        working-directory: core
+        run: cargo fmt --check
+      - name: Clippy
+        working-directory: core
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Core tests
+        working-directory: core
+        run: cargo test
+      - name: Judge self-tests
+        run: python3 -I -m unittest discover -s judge
+      - name: Build Headroom.app (universal)
+        run: bash scripts/bundle.sh
+      - name: CLI smoke test
+        run: |
+          empty=$(mktemp -d)
+          build/Headroom.app/Contents/MacOS/Headroom scan "$empty" --json >/dev/null

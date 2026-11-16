@@ -15,7 +15,7 @@ install or build command again.
 | AI-tool leftovers | Old app/CLI versions not in use, stale install temp folders | Conversation history (`~/.claude/projects`, `~/.codex/sessions`, …) |
 | Docker | Images and build cache, only through `docker` commands | Volumes (they often hold databases); the Docker VM disk |
 | Local AI models | A registry source exists (Ollama registry manifest, Hugging Face repo id, LM Studio download record), and it hasn't been loaded recently | Models built locally (`ollama create`) or imported by hand |
-| Xcode | DerivedData, unavailable simulators (`xcrun simctl delete unavailable`), DeviceSupport, archives older than N months | Archives newer than N months |
+| Xcode | DerivedData, unavailable simulators (each one rechecked, then `xcrun simctl delete <udid>`), DeviceSupport | Archives, at any age: they hold dSYMs and can't be rebuilt. They're listed so you can see their size. |
 | Agent worktrees | The branch is merged, or the worktree is clean with no unpushed commits, **and** every ignored file in it matches a rebuildable rule. Removal goes through `git worktree remove` | `--force`; a worktree holding an ignored `.env` or other unique file |
 
 ## Invariants
