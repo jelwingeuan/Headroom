@@ -52,7 +52,9 @@ Cheap: one `statvfs` and a few small files, no scan. Call it as often as needed.
 ```
 Newest first, at most 500. `dry_run: true` rows are what the dry run would have reclaimed
 (the "Would Have Done" list); they can't be undone because nothing was deleted. `origin` is
-`clean`, `autopilot`, `mcp` or `archive`.
+`clean`, `autopilot`, `mcp` or `archive`. `data_loss` (when present) says what undo can't
+bring back: a simulator's apps and test data. `partial: true` marks a delete that failed
+midway; undo rebuilds over what was left.
 
 ### `undo`
 `{"op": "undo", "id": "1763251200-3"}` brings one action back by re-running its recorded
@@ -91,7 +93,7 @@ The weekly summary for a notification:
 | `tick` | `now`, `free_bytes`, `budget_bytes`, `dry_run`, `dry_run_days_left` |
 | `reclaim` | `id`, `path`, `kind`, `bytes` (private bytes, measured right before deleting) |
 | `would_reclaim` | `path`, `kind`, `bytes`, `reason` (dry run: nothing deleted) |
-| `shrink` | `files`, `bytes` (private bytes of the replaced copies), `measured_bytes` (statvfs delta) |
+| `shrink` | `files`, `bytes` (free space statfs saw come back, at most `private_bytes`), `private_bytes` (what the replaced copies held) |
 | `skip` | `path`, `kind`, `reason` (the recheck before delete refused it) |
 | `shortfall` | `needed_bytes`, `eligible_bytes` (still eligible but not reclaimed; 0 = nothing left), `dry_run` |
 | `error` | `error` |
@@ -111,6 +113,24 @@ The project must be a git top level or a folder with a project file (`package.js
 included); otherwise both tools return an error. There is no tool for settings, undo, other
 paths or forcing anything (docs/THREAT-MODEL.md, invariant 4).
 
+## What the history file holds
+
+`HEADROOM_HOME/history.jsonl`, one action per line: `id`, `at`, `origin`, `path`, `kind`,
+`bytes` (private bytes measured right before the delete), `frees_host` (false for Docker,
+whose space stays inside its VM disk), `cwd`, `steps` (argument arrays undo runs), `fallback`,
+`note` (why nothing needs to run), `lock_file`, `lock_sha256`, `build_secs`, `why`, `undone`,
+and when they apply `new_device` (undo makes a new simulator instead of the same path),
+`data_loss`, `partial`, `error`.
+
+Kinds: the folder names of the project rules (`node_modules`, `target`, `.next`, …), `venv`,
+`worktree`, `DerivedData`, `device_support`, `xcode_archive` (listed, never deleted),
+`simulator`, `claude_code_old`, `codex_temp`, `electron_cache`, `ai_history` (listed, never
+deleted), `ollama_model`, `hf_model`, `lmstudio_model`, `docker_images`, `docker_build_cache`.
+
+`clean --apply --json` also prints `dedupe: {files, bytes}`: identical files in kept
+`node_modules` of projects sharing a lockfile, swapped for clones after the deletes; `bytes` is
+what statfs saw come free and is included in `freed_bytes`.
+
 ## Known limits
 
 - Ollama: "came from the registry" is judged by name (a built-in list of library models or
@@ -119,4 +139,18 @@ paths or forcing anything (docs/THREAT-MODEL.md, invariant 4).
 - LM Studio: the "download record" is any JSON under `~/.lmstudio/.internal` naming the repo;
   that format wasn't checked against a real install.
 - "Recently changed" means git activity (reflog, commits), editor records and what Headroom
-  saw; uncommitted edits made in other editors don't count.
+  saw; uncommitted edits made in other editors don't count. Reflog bookkeeping (the entries
+  `git worktree add` writes, `reset: moving to HEAD`) doesn't count as use.
+- Ollama and Hugging Face "last used" includes file access times, which anything reading the
+  files refreshes (a backup, a hashing script): such a read makes a model look recently used.
+- Simulators: "last used" is simctl's `lastUsedAt`, else the device folder's creation time.
+- Dedupe: the original stays open and linked during each swap and is put back if it was
+  written meanwhile; a write that lands after that final check and before the spare link is
+  removed (microseconds) would be lost from the path.
+- Hugging Face restore passes the snapshot's file names as `allow_patterns`, which are globs: a
+  name containing `*`, `?` or `[` may match other files of that revision, or none.
+- Simulators: "newest of its type" means most recently used (else created), so a type nobody
+  has used for months still keeps one device.
+- Hugging Face: newer huggingface_hub keeps file contents in a store shared by every repo
+  (`hub/blobs/xx/…`) and links to it from each repo folder. Headroom never deletes that shared
+  store, so deleting such a repo folder frees only its links and small files.

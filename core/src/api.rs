@@ -46,6 +46,7 @@ fn history(ctx: &Ctx) -> Json {
             obj! {
                 "id" => a.s("id"), "path" => a.s("path"), "kind" => a.s("kind"), "bytes" => a.get("bytes").cloned(),
                 "at" => a.get("at").cloned(), "origin" => a.s("origin"), "reason" => a.s("why"),
+                "data_loss" => a.get("data_loss").cloned(), "partial" => a.get("partial").cloned(),
                 "undone" => a.get("undone").and_then(Json::bool).unwrap_or(false), "dry_run" => false,
                 "rebuild" => a.get("steps").map(|s| s.arr().iter().map(|x| x.arr().iter().filter_map(Json::str).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join(" && ")),
             }

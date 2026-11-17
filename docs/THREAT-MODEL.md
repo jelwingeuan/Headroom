@@ -7,16 +7,25 @@ test or a judge check.
 ## What Headroom may delete
 
 Only bytes it can prove are rebuildable. "Undo" means rebuilding them by running the recorded
-install or build command again.
+install or build command again. Two exceptions are stated in the table: Chromium caches (the app
+refills them, there is nothing to rebuild) and cold simulators (their test data is lost; undo
+makes a blank device).
 
 | Area | Proof rule | Never |
 |---|---|---|
 | Project build output and dependencies | A marker file sits beside the folder (`node_modules` beside `package.json`, `target` beside `Cargo.toml`…). Ambiguous names (`build`, `dist`, `out`, `vendor`…) only count when git says they are ignored. Nothing inside may be tracked by git. | Folders with tracked files; a venv with no dependency list; a project whose dev server or build is running; a project opened in the last N days |
-| AI-tool leftovers | Old app/CLI versions not in use, stale install temp folders | Conversation history (`~/.claude/projects`, `~/.codex/sessions`, …) |
+| AI-tool leftovers | Old Claude Code versions in `~/.local/share/claude/versions` (not the one `~/.local/bin/claude` points at, not the newest, not one a running program uses), stale install temp folders | Conversation history (`~/.claude/projects`, `~/.codex/sessions`, …); any version when the process list can't be read |
+| AI desktop app caches (Claude, Codex, Cursor) | Only the Chromium caches `Cache`, `Code Cache` and `GPUCache`, only while that app isn't running. Nothing to rebuild: the app refills them on its next launch | The app's data (`Local Storage`, `IndexedDB`, `Preferences`, config); any cache while the app runs or when the process list can't be read |
 | Docker | Images and build cache, only through `docker` commands | Volumes (they often hold databases); the Docker VM disk |
 | Local AI models | A registry source exists (Ollama registry manifest, Hugging Face repo id, LM Studio download record), and it hasn't been loaded recently | Models built locally (`ollama create`) or imported by hand |
 | Xcode | DerivedData, unavailable simulators (each one rechecked, then `xcrun simctl delete <udid>`), DeviceSupport | Archives, at any age: they hold dSYMs and can't be rebuilt. They're listed so you can see their size. |
+| Cold simulators | Shut down, not used for 30 days or more (simctl's `lastUsedAt`, else when the device was created), and not the newest device of its type; rechecked, then `xcrun simctl delete <udid>`. **Data loss:** the device's apps and test data are deleted for good. Undo makes a blank device with the same name, device type and runtime, and History says so | A booted device; the newest device of each type; one used in the last 30 days |
 | Agent worktrees | The branch is merged, or the worktree is clean with no unpushed commits, **and** every ignored file in it matches a rebuildable rule. Removal goes through `git worktree remove` | `--force`; a worktree holding an ignored `.env` or other unique file |
+
+Shrinking deletes nothing: identical files in the `node_modules` of projects that share a
+lockfile become APFS clones of one copy. Both copies are hashed again right before each swap,
+the contents never change (mode and mtime are kept), recent or busy projects are never touched,
+and only the free space statfs actually gained is reported.
 
 ## Invariants
 

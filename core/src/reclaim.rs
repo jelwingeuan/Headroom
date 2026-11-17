@@ -81,6 +81,12 @@ pub fn reclaim(ctx: &Ctx, c: &Cand, origin: &str) -> Result<Json, String> {
         "lock_file" => plan.lock.as_ref(), "lock_sha256" => lock_sha, "build_secs" => build_secs,
         "why" => &f.why, "dev" => f.dev, "ino" => f.ino, "undone" => false,
     };
+    if plan.new_device {
+        action.set("new_device", true);
+    }
+    if !plan.loss.is_empty() {
+        action.set("data_loss", plan.loss.as_str());
+    }
     if let Some(e) = &partial {
         action.set("partial", true);
         action.set("error", e.as_str());
@@ -123,8 +129,15 @@ pub fn clean(ctx: &Ctx, root: &Path, apply: bool, origin: &str) -> Result<Json, 
             }
         }
     }
+    // Copies of one project's dependencies that stay (kept for a hand edit, say) can still
+    // share their blocks. Only what statfs saw come free is counted.
+    let left: Vec<Cand> = s.cands.iter().filter(|c| c.path.exists()).cloned().collect();
+    let groups = crate::shrink::duplicate_groups(&left);
+    let (r, seen) = if groups.is_empty() { Default::default() } else { crate::shrink::shrink(&ctx.home, &groups) };
+    freed += seen;
     Ok(obj! {
         "freed_bytes" => freed, "actions" => actions, "errors" => errors,
+        "dedupe" => obj! {"files" => r.files, "bytes" => seen},
         "snapshot_holding" => crate::machine::snapshot_holding(),
     })
 }

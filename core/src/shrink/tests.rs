@@ -96,3 +96,92 @@ fn restore_refuses_tampered_archives() {
         std::fs::read_dir(&p).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
     assert_eq!(left, [STUB], "a failed restore leaves nothing behind");
 }
+
+#[test]
+fn a_swap_happens_only_when_both_copies_still_hash_the_same() {
+    let t = tmp("shrink-verify");
+    std::fs::write(t.join("src"), vec![5u8; 100_000]).unwrap();
+    std::fs::write(t.join("dup"), vec![5u8; 100_000]).unwrap();
+    let e = sys::list_path(&t).unwrap().into_iter().find(|e| e.name == b"dup").unwrap();
+    let dup = F { path: t.join("dup"), dev: e.dev, ino: e.ino, len: e.len, private: e.private, mtime: e.mtime };
+    // A hash from before someone changed one of them: no swap, nothing changed.
+    assert!(replace_with_clone(&t.join("src"), &dup, &sha256::hex(&[6u8; 100_000])).is_err());
+    assert_eq!(std::fs::metadata(t.join("dup")).unwrap().ino(), e.ino);
+    assert!(!t.join(".dup.headroom-clone").exists());
+    replace_with_clone(&t.join("src"), &dup, &sha256::hex(&[5u8; 100_000])).unwrap();
+    assert_ne!(std::fs::metadata(t.join("dup")).unwrap().ino(), e.ino);
+    assert_eq!(std::fs::read(t.join("dup")).unwrap(), vec![5u8; 100_000]);
+}
+
+#[test]
+fn clean_dedupes_kept_copies_of_one_lockfile_and_never_a_recent_project() {
+    use crate::testutil::{git, touch};
+    let ctx = ctx("shrink-clean");
+    let old = 1_600_000_000;
+    let w = crate::testutil::world(&ctx);
+    let big = vec![9u8; 2 << 20];
+    let mk = |name: &str, when: u64| {
+        let p = w.join(name);
+        write(&p.join("package.json"), r#"{"name":"same"}"#);
+        write(&p.join("package-lock.json"), r#"{"lockfileVersion":3}"#);
+        write(&p.join(".gitignore"), "node_modules/\n");
+        git(&p, &["init", "-q"], Some(when));
+        git(&p, &["add", "-A"], Some(when));
+        git(&p, &["commit", "-qm", "c"], Some(when));
+        std::fs::create_dir_all(p.join("node_modules/typescript/lib")).unwrap();
+        std::fs::write(p.join("node_modules/typescript/lib/typescript.js"), &big).unwrap();
+        write(&p.join("node_modules/.package-lock.json"), "{}");
+        touch(&p.join("node_modules/typescript/lib/typescript.js"), when);
+        touch(&p.join("node_modules/.package-lock.json"), when);
+        // A hand edit keeps each copy from deletion; dedupe keeps every byte, so it may still run.
+        write(&p.join(format!("node_modules/typescript/patch-{name}.js")), name);
+        touch(&p.join(format!("node_modules/typescript/patch-{name}.js")), when + 86_400);
+        p
+    };
+    let copies = [mk("a", old), mk("b", old), mk("c", old)];
+    let recent = mk("d", ctx.now - 86_400);
+    let ino = |p: &Path| std::fs::metadata(p).unwrap().ino();
+    let recent_ino = ino(&recent.join("node_modules/typescript/lib/typescript.js"));
+    let j = crate::reclaim::clean(&ctx, &w, true, "clean").unwrap();
+    assert!(j.get("actions").unwrap().arr().is_empty(), "nothing deleted: {j}");
+    let d = j.get("dedupe").unwrap();
+    assert_eq!(d.get("files"), Some(&Json::Int(2)), "{j}");
+    assert!(
+        d.get("bytes").and_then(Json::u64).unwrap() <= 2 * (2 << 20) + 64 * 1024,
+        "counted bytes never exceed what the copies held"
+    );
+    for p in &copies {
+        assert_eq!(std::fs::read(p.join("node_modules/typescript/lib/typescript.js")).unwrap(), big);
+        let name = p.file_name().unwrap().to_string_lossy();
+        assert_eq!(std::fs::read_to_string(p.join(format!("node_modules/typescript/patch-{name}.js"))).unwrap(), name);
+    }
+    let private: u64 =
+        copies.iter().map(|p| sys::list_path(&p.join("node_modules/typescript/lib")).unwrap()[0].private).sum();
+    assert_eq!(private, 0, "the three copies share one set of blocks");
+    assert_eq!(ino(&recent.join("node_modules/typescript/lib/typescript.js")), recent_ino);
+}
+
+#[test]
+fn a_write_to_the_original_during_the_swap_puts_it_back() {
+    use std::io::Write;
+    let t = tmp("shrink-race");
+    std::fs::write(t.join("src"), vec![5u8; 100_000]).unwrap();
+    std::fs::write(t.join("dup"), vec![5u8; 100_000]).unwrap();
+    let e = sys::list_path(&t).unwrap().into_iter().find(|e| e.name == b"dup").unwrap();
+    let dup = F { path: t.join("dup"), dev: e.dev, ino: e.ino, len: e.len, private: e.private, mtime: e.mtime };
+    // A writer that opened the file before the swap writes right after the rename.
+    let mut writer = std::fs::OpenOptions::new().append(true).open(t.join("dup")).unwrap();
+    let r = swap_checked(&t.join("src"), &dup, &sha256::hex(&[5u8; 100_000]), || {
+        writer.write_all(b"late").unwrap();
+        writer.sync_all().unwrap();
+    });
+    let err = r.unwrap_err().to_string();
+    assert!(err.contains("written during the swap"), "{err}");
+    let mut want = vec![5u8; 100_000];
+    want.extend_from_slice(b"late");
+    assert_eq!(std::fs::read(t.join("dup")).unwrap(), want, "the late write survives");
+    assert_eq!(std::fs::metadata(t.join("dup")).unwrap().ino(), e.ino, "the original is back");
+    let left: Vec<String> =
+        std::fs::read_dir(&t).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+    assert!(left.iter().all(|n| !n.contains("headroom")), "no temporary files left: {left:?}");
+}

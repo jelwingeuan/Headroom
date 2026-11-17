@@ -59,11 +59,11 @@ pub fn dedupe(dirs: &[PathBuf]) -> Dedupe {
         groups.entry((f.dev, h)).or_default().push(f);
     }
     let mut r = Dedupe::default();
-    for (_, mut g) in groups.into_iter().filter(|(_, g)| g.len() > 1) {
+    for ((_, hash), mut g) in groups.into_iter().filter(|(_, g)| g.len() > 1) {
         g.sort_by(|a, b| a.path.cmp(&b.path));
         let src = g[0].path.clone();
         for dup in &g[1..] {
-            if replace_with_clone(&src, dup).is_ok() {
+            if replace_with_clone(&src, dup, &hash).is_ok() {
                 r.files += 1;
                 r.bytes += dup.private;
             }
@@ -72,24 +72,92 @@ pub fn dedupe(dirs: &[PathBuf]) -> Dedupe {
     r
 }
 
-fn replace_with_clone(src: &Path, dup: &F) -> std::io::Result<()> {
+/// Swaps `dup` for a clone of `src`, only if both still hash to `hash`: contents never change,
+/// only which blocks hold them. The original stays open and linked under a spare name during
+/// the swap; if it was written meanwhile (length or mtime moved), it is put back.
+fn replace_with_clone(src: &Path, dup: &F, hash: &str) -> std::io::Result<()> {
+    swap_checked(src, dup, hash, || {})
+}
+
+fn swap_checked(src: &Path, dup: &F, hash: &str, after_rename: impl FnOnce()) -> std::io::Result<()> {
     let name = dup.path.file_name().unwrap_or_default().to_string_lossy();
     let tmp = dup.path.with_file_name(format!(".{name}.headroom-clone"));
+    let keep = dup.path.with_file_name(format!(".{name}.headroom-orig"));
+    let changed = || std::io::Error::other("changed while deduping: not swapped");
+    let stamp = |m: &fs::Metadata| (m.dev(), m.ino(), m.len(), m.modified().ok());
+    let orig = OpenOptions::new().read(true).custom_flags(0x100 /* O_NOFOLLOW */).open(&dup.path)?;
+    let before = orig.metadata()?;
+    if (before.dev(), before.ino(), before.len(), before.mtime()) != (dup.dev, dup.ino, dup.len, dup.mtime)
+        || !before.is_file()
+    {
+        return Err(changed());
+    }
     let _ = fs::remove_file(&tmp);
+    let _ = fs::remove_file(&keep);
     sys::clone_file(src, &tmp)?;
     let done = (|| {
-        let m = fs::symlink_metadata(&dup.path)?;
-        if (m.dev(), m.ino(), m.len(), m.mtime()) != (dup.dev, dup.ino, dup.len, dup.mtime) || !m.is_file() {
-            return Err(std::io::Error::other("changed while deduping"));
+        if sha256::file(&tmp)? != hash || sha256::reader(&orig)? != hash {
+            return Err(std::io::Error::other("contents differ: not swapped"));
         }
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(m.mode() & 0o7777))?;
-        OpenOptions::new().write(true).open(&tmp)?.set_modified(m.modified()?)?;
-        fs::rename(&tmp, &dup.path)
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(before.mode() & 0o7777))?;
+        OpenOptions::new().write(true).open(&tmp)?.set_modified(before.modified()?)?;
+        // Unchanged since it was hashed, through the open file and through the path.
+        if stamp(&orig.metadata()?) != stamp(&before) || stamp(&fs::symlink_metadata(&dup.path)?) != stamp(&before) {
+            return Err(changed());
+        }
+        fs::hard_link(&dup.path, &keep)?;
+        fs::rename(&tmp, &dup.path)?;
+        after_rename();
+        let now = orig.metadata()?;
+        if (now.len(), now.modified().ok()) != (before.len(), before.modified().ok()) {
+            fs::rename(&keep, &dup.path)?; // a late write: the original, with it, goes back
+            return Err(std::io::Error::other("written during the swap: original put back"));
+        }
+        fs::remove_file(&keep)
     })();
     if done.is_err() {
         let _ = fs::remove_file(&tmp);
+        // `keep` is only left if the original is back at its path or still is (same inode).
+        if fs::symlink_metadata(&dup.path).is_ok_and(|m| m.ino() == dup.ino) {
+            let _ = fs::remove_file(&keep);
+        }
     }
     done
+}
+
+/// node_modules of projects with the same lockfile (identical dependency trees), grouped:
+/// the dedupe targets. Only folders Headroom may touch (not tracked, busy or recent).
+pub fn duplicate_groups(cands: &[scan::Cand]) -> Vec<Vec<PathBuf>> {
+    let mut by: HashMap<String, Vec<PathBuf>> = HashMap::new();
+    for c in cands.iter().filter(|c| c.touchable && c.kind == "node_modules" && c.path.is_dir()) {
+        let lock = crate::rebuild::NODE_LOCKS.iter().map(|l| c.base.join(l)).find(|p| p.is_file());
+        if let Some(h) = lock.and_then(|l| sha256::file(&l).ok()) {
+            by.entry(h).or_default().push(c.path.clone());
+        }
+    }
+    by.into_values().filter(|v| v.len() > 1).collect()
+}
+
+/// Dedupes each group and reports the bytes statfs saw come free (never more than the copies
+/// held privately): other activity on the volume can't inflate the number.
+pub fn shrink(home: &Path, groups: &[Vec<PathBuf>]) -> (Dedupe, u64) {
+    sys::sync_all();
+    let before = sys::free_bytes(home);
+    let mut total = Dedupe::default();
+    for g in groups {
+        let r = dedupe(g);
+        total.files += r.files;
+        total.bytes += r.bytes;
+    }
+    sys::sync_all();
+    let mut after = sys::free_bytes(home);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while after < before + total.bytes && std::time::Instant::now() < end {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        after = after.max(sys::free_bytes(home));
+    }
+    let seen = after.saturating_sub(before).min(total.bytes);
+    (total, seen)
 }
 
 // ---------------------------------------------------------------- archive / restore

@@ -9,17 +9,6 @@ use crate::state::{self, Ctx, DAY};
 use crate::{obj, reclaim, shrink, sys};
 use std::time::{Duration, Instant};
 
-fn costly(ctx: &Ctx, c: &Cand) -> bool {
-    let measured = state::history(ctx)
-        .iter()
-        .rev()
-        .find(|a| a.s("path") == c.path.to_string_lossy())
-        .and_then(|a| a.get("rebuild_secs")?.u64());
-    let has_steps = c.plan.as_ref().is_some_and(|p| !p.steps.is_empty());
-    has_steps
-        && (measured.unwrap_or(0) >= 120 || matches!(c.kind.as_str(), "target" | "DerivedData" | ".build" | ".next"))
-}
-
 /// Waits (up to 3 s) for APFS to hand back freed blocks; returns the free bytes seen last.
 fn settle(ctx: &Ctx, budget: u64) -> u64 {
     sys::sync_all();
@@ -62,20 +51,17 @@ pub fn tick(ctx: &Ctx, budget: u64, emit: &mut dyn FnMut(Json)) -> bool {
         .collect();
     state::observe(ctx, &busy);
     st.set("permission_errors", s.denied);
+    let groups = shrink::duplicate_groups(&s.cands);
     let mut pool: Vec<Cand> = s.cands.into_iter().filter(|c| c.reclaimable() && c.frees_host).collect();
     pool.sort_by_key(|c| (c.active.unwrap_or(0), std::cmp::Reverse(c.bytes)));
 
+    // Shrink before deleting: identical copies of one project's dependencies become clones.
     let shrunk_lately = st.get("last_shrink").and_then(Json::u64).is_some_and(|t| t + DAY > ctx.now);
-    if !dry && !shrunk_lately && pool.first().is_some_and(|c| costly(ctx, c)) {
-        let dirs: Vec<_> =
-            pool.iter().filter(|c| c.kind == "node_modules" || c.kind == "venv").map(|c| c.path.clone()).collect();
-        let before = sys::free_bytes(&ctx.home);
-        let r = shrink::dedupe(&dirs);
+    if !dry && !shrunk_lately && !groups.is_empty() {
+        let (r, seen) = shrink::shrink(&ctx.home, &groups);
         free = settle(ctx, budget);
         st.set("last_shrink", ctx.now);
-        emit(
-            obj! {"event" => "shrink", "files" => r.files, "bytes" => r.bytes, "measured_bytes" => free.saturating_sub(before)},
-        );
+        emit(obj! {"event" => "shrink", "files" => r.files, "bytes" => seen, "private_bytes" => r.bytes});
     }
 
     let mut i = 0;
@@ -201,9 +187,17 @@ mod tests {
         let coldest = project(&ctx, "coldest", 1_500_000_000);
         let cold = project(&ctx, "cold", 1_600_000_000);
         let recent = project(&ctx, "recent", ctx.now - DAY);
+        let ino = |p: &Path| std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(p).unwrap());
+        let recent_blob = recent.join("node_modules/x/blob.js");
+        let recent_ino = ino(&recent_blob);
         // Far more than everything eligible: it must take both cold ones, coldest first, then
         // report a shortfall with nothing eligible left, and leave the recent project alone.
         let ev = run(&ctx, sys::free_bytes(&ctx.home) + (1 << 40));
+        // The two cold copies share a lockfile: shrunk (cloned) before anything is deleted.
+        let shrink = ev.iter().position(|e| e.s("event") == "shrink").expect("a shrink event");
+        assert_eq!(ev[shrink].get("files"), Some(&Json::Int(1)));
+        assert!(ev.iter().position(|e| e.s("event") == "reclaim").unwrap() > shrink);
+        assert_eq!(ino(&recent_blob), recent_ino, "a recent project's files are never swapped");
         let reclaimed: Vec<PathBuf> =
             ev.iter().filter(|e| e.s("event") == "reclaim").map(|e| PathBuf::from(e.s("path"))).collect();
         assert_eq!(reclaimed, [coldest.join("node_modules"), cold.join("node_modules")]);

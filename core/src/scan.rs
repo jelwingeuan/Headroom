@@ -56,6 +56,9 @@ pub struct Cand {
     pub frees_host: bool,
     pub machine: bool,
     pub plan: Option<rebuild::Plan>,
+    /// Passed the rules that protect work in progress (tracked, ambiguous, busy, recent): its
+    /// files may be swapped for identical clones even when it can't be deleted.
+    pub touchable: bool,
     newest_file: Option<(i64, PathBuf)>,
 }
 
@@ -80,6 +83,7 @@ impl Cand {
             frees_host: true,
             machine: false,
             plan: None,
+            touchable: false,
             newest_file: None,
         }
     }
@@ -319,7 +323,7 @@ fn size_all(cands: &mut [Cand]) {
             continue;
         }
         match &c.how {
-            How::Tree | How::Worktree => {
+            How::Tree | How::Worktree | How::Simctl(_) => {
                 tasks.push((i, c.path.clone(), if c.kind == "node_modules" { Track::NodeTop } else { Track::No }))
             }
             How::Files(files) => c.bytes = files_bytes(files),
@@ -425,19 +429,28 @@ pub fn known_agent(cmdline: &str) -> bool {
     QUIET.contains(&proc::program(cmdline)) || AGENT_HINTS.iter().any(|h| cmdline.contains(h))
 }
 
-/// (program, working folder) of every running process but this one, or None when `lsof`
-/// couldn't tell (missing, failed, timed out): then nothing counts as idle.
-pub fn cwds() -> Option<Vec<(String, PathBuf)>> {
+/// A running program and its working folder. `quiet`: a shell or coding agent (or the agent
+/// that started Headroom), which sits in a project without using its dependencies.
+#[derive(Clone, Debug)]
+pub struct Proc {
+    pub name: String,
+    pub dir: PathBuf,
+    pub quiet: bool,
+}
+
+/// Every running program but this one, or None when `lsof` couldn't tell (missing, failed,
+/// timed out): then nothing counts as idle.
+pub fn cwds() -> Option<Vec<Proc>> {
     cwds_with(Path::new("/usr/sbin/lsof"))
 }
 
-pub fn cwds_with(lsof: &Path) -> Option<Vec<(String, PathBuf)>> {
+pub fn cwds_with(lsof: &Path) -> Option<Vec<Proc>> {
     let mut c = std::process::Command::new(lsof);
     c.args(["-nP", "-w", "-d", "cwd", "-Fpcn"]);
     let text = proc::run(c, 30).filter(|o| o.code.is_some())?.stdout;
     let me = std::process::id().to_string();
-    // The parent (whatever started Headroom) is skipped only if it is a shell or an agent:
-    // an MCP client sits in its project without needing its dependencies; `node` doesn't.
+    // The parent (whatever started Headroom) is quiet only if it is a shell or an agent: an MCP
+    // client sits in its project without needing its dependencies; `node server.js` doesn't.
     let ppid = std::os::unix::process::parent_id();
     let mut ps = std::process::Command::new("/bin/ps");
     ps.args(["-o", "command=", "-p", &ppid.to_string()]);
@@ -450,9 +463,11 @@ pub fn cwds_with(lsof: &Path) -> Option<Vec<(String, PathBuf)>> {
                 seen = true;
             }
             Some(("c", v)) => cmd = v.into(),
-            Some(("n", v)) if pid != me && Some(&pid) != parent.as_ref() && !QUIET.contains(&cmd.as_str()) => {
-                out.push((cmd.clone(), PathBuf::from(v)))
-            }
+            Some(("n", v)) if pid != me && cmd != "lsof" => out.push(Proc {
+                name: cmd.clone(),
+                dir: PathBuf::from(v),
+                quiet: QUIET.contains(&cmd.as_str()) || Some(&pid) == parent.as_ref(),
+            }),
             _ => {}
         }
     }
@@ -461,12 +476,14 @@ pub fn cwds_with(lsof: &Path) -> Option<Vec<(String, PathBuf)>> {
 }
 
 /// Programs working inside `project`, or in a project folder that encloses it (a dev server
-/// at a monorepo's root uses every package's dependencies).
-fn busy_in(cwds: &[(String, PathBuf)], enclosing: &[PathBuf], project: &Path) -> Option<String> {
+/// at a monorepo's root uses every package's dependencies). `strict` counts shells and agents
+/// too: a worktree an agent is sitting in is in use.
+fn busy_in(cwds: &[Proc], enclosing: &[PathBuf], project: &Path, strict: bool) -> Option<String> {
     let mut names: Vec<&str> = cwds
         .iter()
-        .filter(|(_, d)| d.starts_with(project) || (project.starts_with(d) && enclosing.contains(d)))
-        .map(|(n, _)| n.as_str())
+        .filter(|p| strict || !p.quiet)
+        .filter(|p| p.dir.starts_with(project) || (project.starts_with(&p.dir) && enclosing.contains(&p.dir)))
+        .map(|p| p.name.as_str())
         .collect();
     names.sort_unstable();
     names.dedup();
@@ -490,7 +507,7 @@ struct GitFacts {
 /// Decides, for every candidate, whether it may go and why, and sizes the ones that may.
 /// Kept folders aren't walked (their `bytes` stay 0): listing a million files costs seconds
 /// even warm, and only what may go needs an honest size.
-pub fn judge(ctx: &Ctx, cands: &mut [Cand], cwds: Option<&[(String, PathBuf)]>) {
+pub fn judge(ctx: &Ctx, cands: &mut [Cand], cwds: Option<&[Proc]>) {
     for c in cands.iter_mut() {
         if let Ok(m) = std::fs::symlink_metadata(&c.path) {
             (c.dev, c.ino) = (m.dev(), m.ino());
@@ -538,7 +555,8 @@ pub fn judge(ctx: &Ctx, cands: &mut [Cand], cwds: Option<&[(String, PathBuf)]>) 
     let mut enclosing: Vec<PathBuf> = cwds
         .unwrap_or(&[])
         .iter()
-        .map(|(_, d)| d.clone())
+        .filter(|p| !p.quiet)
+        .map(|p| p.dir.clone())
         .filter(|d| d.starts_with(&ctx.home) && *d != ctx.home)
         .collect();
     enclosing.sort();
@@ -595,7 +613,7 @@ fn decide(
     c: &mut Cand,
     git: Option<&Option<GitFacts>>,
     worktree: Option<&Result<(), String>>,
-    cwds: Option<&[(String, PathBuf)]>,
+    cwds: Option<&[Proc]>,
     enclosing: &[PathBuf],
     cutoff: u64,
 ) -> Result<(), String> {
@@ -645,7 +663,7 @@ fn decide(
         let Some(cwds) = cwds else {
             return Err("in use? lsof couldn't list running programs, so nothing in a project is touched".into());
         };
-        if let Some(who) = busy_in(cwds, enclosing, p) {
+        if let Some(who) = busy_in(cwds, enclosing, p, c.how == How::Worktree) {
             return Err(format!("in use: {who} is working in {}", p.display()));
         }
     }
@@ -662,6 +680,7 @@ fn decide(
             None => return Err("no sign of when it was last used".into()),
         }
     }
+    c.touchable = true;
     if c.kind == "node_modules" && !INSTALL_RECORDS.iter().any(|r| std::fs::symlink_metadata(c.path.join(r)).is_ok()) {
         return Err(
             "no install record (node_modules/.package-lock.json) to tell hand edits from installed files".into()

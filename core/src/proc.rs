@@ -66,11 +66,13 @@ fn is_executable(p: &Path) -> bool {
     std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
-/// Every running program's command line (`ps -axo command=`).
-pub fn processes() -> Vec<String> {
+/// Every running program's command line (`ps -axo command=`), or None when ps couldn't tell:
+/// callers then treat every app as running.
+pub fn processes() -> Option<Vec<String>> {
     let mut c = Command::new("/bin/ps");
     c.args(["-axo", "command="]);
-    run(c, 10).map(|o| o.stdout.lines().map(|l| l.trim().to_string()).collect()).unwrap_or_default()
+    let lines: Vec<String> = run(c, 10).filter(Out::ok)?.stdout.lines().map(|l| l.trim().to_string()).collect();
+    (!lines.is_empty()).then_some(lines)
 }
 
 /// The program name of a `ps` command line: "/Applications/Cursor.app/Contents/MacOS/Cursor -x" -> "Cursor".

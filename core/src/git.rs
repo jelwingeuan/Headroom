@@ -106,9 +106,18 @@ pub fn last_activity(top: &Path) -> Option<u64> {
     run(top, &["log", "-1", "--format=%ct", "HEAD"]).filter(Out::ok).and_then(|o| o.stdout.trim().parse().ok())
 }
 
-/// "<old> <new> Name <mail> 1700000000 +0100\tmessage" -> 1700000000.
+/// "<old> <new> Name <mail> 1700000000 +0100\tmessage" -> 1700000000. Two entries are only
+/// bookkeeping and don't count as use: the one `git worktree add` writes when it creates a
+/// worktree (no previous commit, no message) and its "reset: moving to HEAD". Everything else,
+/// a checkout to a new branch at the same commit included, is use.
 fn reflog_time(line: &str) -> Option<u64> {
-    let head = line.split('\t').next()?;
+    let (head, msg) = line.split_once('\t').unwrap_or((line, ""));
+    let old = head.split(' ').next()?;
+    let msg = msg.trim();
+    let created = old.bytes().all(|b| b == b'0') && (msg.is_empty() || msg.starts_with("worktree add"));
+    if created || msg == "reset: moving to HEAD" {
+        return None;
+    }
     let mut parts = head.rsplitn(3, ' ');
     let _tz = parts.next()?;
     parts.next()?.parse().ok()
@@ -158,6 +167,13 @@ mod tests {
     fn reads_reflog_time() {
         let l = "0000 1111 Judge <j@x> 1700000123 +0000\tcommit (initial): Initial commit";
         assert_eq!(reflog_time(l), Some(1_700_000_123));
+        // What `git worktree add` writes is bookkeeping, not use.
+        assert_eq!(reflog_time("0000 b2be J <j@x> 1794900271 +0800"), None);
+        assert_eq!(reflog_time("b2be b2be J <j@x> 1794900271 +0800\treset: moving to HEAD"), None);
+        // Switching branch at the same commit is someone working here.
+        let co = "b2be b2be J <j@x> 1794900271 +0800\tcheckout: moving from agent/m to fix";
+        assert_eq!(reflog_time(co), Some(1_794_900_271));
+        assert_eq!(reflog_time("0000 aaaa J <j@x> 1794900271 +0800\tclone: from https://x"), Some(1_794_900_271));
     }
 
     #[test]
