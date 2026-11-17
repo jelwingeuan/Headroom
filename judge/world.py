@@ -2,9 +2,11 @@
 """Builds the judge's ground truth on a fresh CI runner and writes judge/out/truth.json.
 
 Real projects (Node, Next.js, Rust, Python venvs, Swift packages built with xcodebuild), the
-traps Headroom must not fall into, and the fixtures it reads (git dates, VS Code's open
-windows, Ollama and Hugging Face models, a recording docker shim). It installs software,
-starts a dev server and writes into ~/.claude, ~/.codex and VS Code's settings, so it refuses
+traps Headroom must not fall into, cold reclaimable stock in every bucket (duplicate
+node_modules, big Rust targets, DerivedData, cold iOS simulators, old Claude Code versions, an
+Electron cache, Ollama and Hugging Face models, a merged agent worktree) and the fixtures it
+reads (git dates, VS Code's open windows, a recording docker shim). It installs software,
+starts a dev server and writes into ~/.claude, ~/.codex, ~/.local and ~/Library, so it refuses
 to run outside GitHub Actions unless --force-local is passed.
 
   python3 -I judge/world.py [--root ~/judge-world] [--tauri]
@@ -13,6 +15,8 @@ import argparse
 import binascii
 import json
 import os
+import plistlib
+import re
 import shutil
 import socket
 import stat
@@ -33,9 +37,15 @@ DERIVED = os.path.join(HOME, 'Library/Developer/Xcode/DerivedData')
 VSCODE_STORAGE = os.path.join(HOME, 'Library/Application Support/Code/User/globalStorage/storage.json')
 DOCKER_DESKTOP = os.path.join(HOME, 'Library/Containers/com.docker.docker')
 OLLAMA_MODELS = os.path.join(HOME, '.ollama/models')
+OLLAMA_BASE, OLLAMA_SPARE = 'all-minilm', 'nomic-embed-text'  # base of the custom model; a pulled model nothing uses
 HF_REPO = 'hf-internal-testing/tiny-random-bert'
 HF_CACHE = os.path.join(HOME, '.cache/huggingface/hub')
 REMOTES = os.path.join(HOME, 'judge-remotes')
+SIM_DEVICES = os.path.join(HOME, 'Library/Developer/CoreSimulator/Devices')
+CLAUDE_VERSIONS = os.path.join(HOME, '.local/share/claude/versions')
+CLAUDE_BIN = os.path.join(HOME, '.local/bin/claude')
+CLAUDE_DESKTOP = os.path.join(HOME, 'Library/Application Support/Claude')
+MARGIN = 15 * GB  # free space the world never plans to use
 # Quiet, non-interactive package managers, for setup and for the judge's own checks.
 ENV = {
     'npm_config_audit': 'false', 'npm_config_fund': 'false', 'npm_config_update_notifier': 'false',
@@ -52,10 +62,18 @@ RUST = ['serde = { version = "1", features = ["derive"] }\nserde_json = "1"', 'r
         'tokio = { version = "1", features = ["rt", "macros"] }']
 PYTHON = [['requests'], ['rich'], ['click', 'pyyaml'], ['attrs', 'packaging'], ['httpx']]
 SWIFT = ['SwiftAlpha', 'SwiftBravo', 'SwiftCharlie', 'SwiftDelta']
-FULL = {'node': len(NODE), 'next': 3, 'rust': len(RUST), 'python': len(PYTHON), 'swift': len(SWIFT)}
+# Cold stock: copies of one project sharing a lockfile (a dedupe target) and heavy Rust builds.
+DUPE_DEPS = {'typescript': '^5', 'webpack': '^5', 'eslint': '^9', 'prettier': '^3'}
+RUST_BIG = ('tokio = { version = "1", features = ["full"] }\nserde = { version = "1", features = ["derive"] }\n'
+            'serde_json = "1"\nregex = "1"\nclap = { version = "4", features = ["derive"] }\n'
+            'reqwest = { version = "0.12", features = ["json"] }\nchrono = "0.4"\nrand = "0.8"')
+FULL = {'node': len(NODE), 'next': 3, 'rust': len(RUST), 'python': len(PYTHON), 'swift': len(SWIFT),
+        'dupe': 8, 'rustbig': 3}
+MIN = {'dupe': 5}
 TRAPS = 5
-EST_MB = {'node': 40, 'next': 450, 'rust': 250, 'python': 45, 'swift': 150}
-FIXED_MB = 800  # traps, models, package-manager caches
+EST_MB = {'node': 40, 'next': 450, 'rust': 250, 'python': 45, 'swift': 150, 'dupe': 130, 'rustbig': 900}
+STOCK_MB = {'simulator': 400, 'claude_version': 200, 'electron_cache': 300, 'electron_code_cache': 100}
+FIXED_MB = 1100  # traps, models, the newest simulator, package-manager caches
 
 
 def free_bytes(path=HOME):
@@ -64,14 +82,20 @@ def free_bytes(path=HOME):
 
 
 def fit_ratio(free):
-    # Later the disk holds about twice the world (package caches, rebuilds, autopilot growth)
-    # plus ~3 GB (the 1M-file speed tree, Headroom's own build).
-    full = (sum(FULL[k] * EST_MB[k] for k in FULL) + FIXED_MB) * MB
-    return max(0.0, min(1.0, (free - 3 * GB) / 2 / full))
+    # Later the disk holds about twice the world (package caches, rebuilds, autopilot growth);
+    # MARGIN stays free on top (the 1M-file speed tree, Headroom's own build, the runner).
+    stock = 2 * STOCK_MB['simulator'] + 4 * STOCK_MB['claude_version'] + STOCK_MB['electron_cache'] \
+        + STOCK_MB['electron_code_cache']
+    full = (sum(FULL[k] * EST_MB[k] for k in FULL) + stock + FIXED_MB) * MB
+    return max(0.0, min(1.0, (free - MARGIN) / 2 / full))
 
 
 def counts(ratio):
-    return {k: max(1, int(n * ratio + 1e-9)) for k, n in FULL.items()}
+    return {k: max(MIN.get(k, 1), int(n * ratio + 1e-9)) for k, n in FULL.items()}
+
+
+def stock_size(kind, ratio):
+    return max(16 * MB, int(STOCK_MB[kind] * MB * ratio))
 
 
 def plan(c):
@@ -94,9 +118,11 @@ def activity(i):
     return 'cold', 60 + (i * 37) % 141
 
 
-def alloc_bytes(*paths):
-    """Allocated bytes under all paths together (st_blocks), each hard link counted once."""
-    seen, total, stack = set(), 0, list(paths)
+def alloc_bytes(*paths, seen=None):
+    """Allocated bytes under all paths together (st_blocks), each hard link counted once. Pass the
+    same seen set to several calls to count a link once across them."""
+    seen = set() if seen is None else seen
+    total, stack = 0, list(paths)
     while stack:
         p = stack.pop()
         try:
@@ -160,6 +186,19 @@ def write(path, name, text):
     return p
 
 
+def fill(path, size, head=b''):
+    """A file of size bytes (head, then zeros) that really takes the space on disk."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    chunk = b'\0' * (8 * MB)
+    with open(path, 'wb') as f:
+        f.write(head)
+        left = size - len(head)
+        while left > 0:
+            f.write(chunk[:left])
+            left -= len(chunk)
+    return path
+
+
 def sh(cmd, cwd, tries=1, timeout=1800):
     """Runs one setup command; returns {cmd, cwd, secs} or raises with the tail of its output."""
     for _ in range(tries):
@@ -210,7 +249,7 @@ def node(path, when, deps, edited):
         with open(f, 'a') as fh:
             fh.write('\n// patched by hand, keep: judge fixture\n')
         rec['keep'] = [f]
-        rec['rebuild'][0]['eligible'] = False
+        rec['rebuild'][0].update(eligible=False, why='hand-edited file inside')
     return rec
 
 
@@ -266,14 +305,35 @@ def swift(path, when, name):
     steps = [sh(cmd, path)]
     commit(path, when)
     new = sorted(set(os.listdir(DERIVED)) - before)
-    if not any(n.startswith(name + '-') for n in new):
-        raise RuntimeError('xcodebuild left no DerivedData folder')
+    own = derived_data_of(path, name)
+    if not own:
+        raise RuntimeError(f'no DerivedData folder points at {path}; new entries: {new}')
     # Other new entries (ModuleCache.noindex, ...) are shared by every Xcode build.
-    rebuild = [{'path': os.path.join(DERIVED, n), 'cmd': cmd, 'cwd': path, 'shared': not n.startswith(name + '-')}
-               for n in new]
+    rebuild = [{'path': p, 'cmd': cmd, 'cwd': path, 'kind': 'DerivedData'} for p in own]
+    rebuild += [{'path': os.path.join(DERIVED, n), 'cmd': cmd, 'cwd': path, 'kind': 'DerivedData', 'shared': True}
+                for n in new if os.path.join(DERIVED, n) not in own]
     if os.path.isdir(os.path.join(path, '.build')):  # in case xcodebuild also resolves into .build
         rebuild.append({'path': os.path.join(path, '.build'), 'cmd': cmd, 'cwd': path})
     return {'steps': steps, 'verify': cmd, 'rebuild': rebuild}
+
+
+def derived_data_of(project, package='', derived=DERIVED):
+    """Xcode's DerivedData folders for project: named <folder or package>-<28-letter hash>, and
+    confirmed by the WorkspacePath in the folder's info.plist."""
+    names = {os.path.basename(project.rstrip('/')), package} - {''}
+    shape = re.compile('(' + '|'.join(map(re.escape, sorted(names))) + ')-[a-z]{28}')
+    out = []
+    for n in sorted(os.listdir(derived)) if os.path.isdir(derived) else []:
+        if not shape.fullmatch(n):
+            continue
+        try:
+            with open(os.path.join(derived, n, 'info.plist'), 'rb') as f:
+                ws = plistlib.load(f).get('WorkspacePath')
+        except Exception:  # unreadable or not a plist: not provably this project's
+            continue
+        if isinstance(ws, str) and inside(os.path.normpath(ws), os.path.normpath(project)):
+            out.append(os.path.join(derived, n))
+    return out
 
 
 def untracked_build(path, when):
@@ -334,10 +394,26 @@ def agent_repo(path, when):
     write(wt('env'), '.env', 'API_URL=http://localhost:8080\n')
     add = 'git worktree add .claude/worktrees/merged agent/merged'
     return {'verify': 'git -C .claude/worktrees/merged rev-parse --verify HEAD',
-            'rebuild': [{'path': wt('merged'), 'cmd': add, 'cwd': path},
-                        {'path': os.path.join(path, '.git', 'worktrees', 'merged'), 'cmd': add, 'cwd': path}],
+            'rebuild': [{'path': wt('merged'), 'cmd': add, 'cwd': path, 'kind': 'merged worktree'},
+                        {'path': os.path.join(path, '.git', 'worktrees', 'merged'), 'cmd': add, 'cwd': path,
+                         'kind': 'merged worktree'}],
             'protected': [{'path': wt('unpushed'), 'why': 'worktree with unpushed commits'},
                           {'path': wt('env'), 'why': 'worktree with an ignored .env'}]}
+
+
+def dupe(path, when, template):
+    """One copy of the same app: same package.json and lockfile, so the same node_modules."""
+    if template:
+        for f in ('package.json', 'package-lock.json'):
+            shutil.copy2(os.path.join(template, f), os.path.join(path, f))
+    else:
+        package_json(path, DUPE_DEPS, name='dupe-app')
+    write(path, 'index.js', "console.log('hello');\n")
+    write(path, '.gitignore', 'node_modules/\n')
+    steps = [sh('npm ci' if template else 'npm install', path, tries=2)]
+    commit(path, when)
+    return {'steps': steps, 'verify': 'npm ls --depth=0',
+            'rebuild': [{'path': os.path.join(path, 'node_modules'), 'cmd': 'npm ci', 'cwd': path}]}
 
 
 def nomanifest_venv(path, when):
@@ -383,6 +459,22 @@ def tauri(path, when):
     return {'steps': steps, 'verify': 'cd src-tauri && cargo build', 'rebuild': rebuild}
 
 
+def add_rebuildable(truth, path, cmd, cwd, kind=None, eligible=True, why=None, project=None, mtime=None,
+                    restore='path', **extra):
+    """One thing Headroom may delete. restore: 'path' = rebuild must bring the path back;
+    'none' = nothing needs it back (a cache its app refills, an old version);
+    'simulator' = a blank device with the same name, type and runtime must exist."""
+    e = {'path': path, 'cmd': cmd, 'cwd': cwd, 'kind': kind or os.path.basename(path), 'project': project,
+         'mtime': mtime, 'eligible': eligible, 'restore': restore, 'bytes': 0}
+    if why:
+        e['why'] = why
+    e.update(extra)
+    truth['rebuildable'].append(e)
+    if mtime and not project:
+        truth['backdate'].append([path, mtime])
+    return e
+
+
 def add_project(truth, name, kind, act, days, fn, *args):
     path = os.path.join(truth['root'], name)
     when = truth['created'] - days * DAY
@@ -406,9 +498,8 @@ def add_project(truth, name, kind, act, days, fn, *args):
                 truth['manifest_roots'].append(r['path'])
                 truth['recent_paths'].append(r['path'])
             continue
-        truth['rebuildable'].append({'path': r['path'], 'cmd': r['cmd'], 'cwd': r['cwd'],
-                                     'project': name if mine else None, 'mtime': when if mine else None,
-                                     'eligible': r.get('eligible', True), 'bytes': 0})
+        add_rebuildable(truth, r['path'], r['cmd'], r['cwd'], r.get('kind'), r.get('eligible', True), r.get('why'),
+                        project=name if mine else None, mtime=when if mine else None)
         if mine:
             p['verify_cmd'] = rec.get('verify')
             if not inside(r['path'], path):
@@ -442,17 +533,28 @@ def port_open(port):
         return False
 
 
-def ollama_files(name):
+def ollama_manifest(name, models=OLLAMA_MODELS):
+    """A model's manifest, <models>/manifests/<host>/<namespace>/<name>/<tag>, wherever Ollama put it."""
+    top = os.path.join(models, 'manifests')
+    found = sorted(os.path.join(d, 'latest') for d, _, files in os.walk(top)
+                   if os.path.basename(d) == name and 'latest' in files)
+    if not found:
+        listing = sorted(os.path.relpath(os.path.join(d, f), models) for d, _, fs in os.walk(top) for f in fs)
+        raise RuntimeError(f'no manifest for {name}; manifests on disk: {listing[:20]}')
+    return found[0]
+
+
+def ollama_files(name, models=OLLAMA_MODELS):
     """The manifest of an Ollama model plus every blob it references."""
-    m = os.path.join(OLLAMA_MODELS, 'manifests', 'registry.ollama.ai', 'library', name, 'latest')
+    m = ollama_manifest(name, models)
     with open(m) as f:
         data = json.load(f)
     digests = [data['config']['digest']] + [layer['digest'] for layer in data['layers']]
-    return [m] + [os.path.join(OLLAMA_MODELS, 'blobs', d.replace(':', '-')) for d in digests]
+    return [m] + [os.path.join(models, 'blobs', d.replace(':', '-')) for d in digests]
 
 
 def ollama(truth):
-    """One pulled registry model (may go) and one `ollama create` model on top of it (must survive)."""
+    """Two pulled registry models (may go) and an `ollama create` model built on one (must survive)."""
     try:
         if not shutil.which('ollama'):
             sh('brew install ollama', HOME, timeout=1500)
@@ -462,30 +564,46 @@ def ollama(truth):
         try:
             if not wait_for(lambda: subprocess.run([exe, 'list'], capture_output=True).returncode == 0, 60):
                 raise RuntimeError('ollama serve did not come up')
-            sh(f'{exe} pull all-minilm', HOME, tries=2, timeout=900)
+            for m in (OLLAMA_BASE, OLLAMA_SPARE):
+                sh(f'{exe} pull {m}', HOME, tries=2, timeout=900)
             tmp = tempfile.mkdtemp(prefix='judge-modelfile-')
-            write(tmp, 'Modelfile', 'FROM all-minilm\nPARAMETER num_ctx 256\n')
-            sh(f'{exe} create judge-custom -f Modelfile', tmp, timeout=900)
+            write(tmp, 'Modelfile', f'FROM {OLLAMA_BASE}\nPARAMETER num_ctx 256\n')
+            made = subprocess.run([exe, 'create', 'judge-custom', '-f', 'Modelfile'], cwd=tmp, capture_output=True,
+                                  text=True, timeout=900)
+            listed = subprocess.run([exe, 'list'], capture_output=True, text=True).stdout
+            with open(os.path.join(OUT, 'ollama-create.log'), 'w') as f:
+                f.write(f'$ ollama create judge-custom -f Modelfile  (exit {made.returncode})\n{made.stdout}{made.stderr}'
+                        f'\n$ ollama list\n{listed}')
         finally:
             srv.terminate()
             try:
                 srv.wait(30)
             except subprocess.TimeoutExpired:
                 srv.kill()
-        custom = ollama_files('judge-custom')
-        registry = ollama_files('all-minilm')
-        # The custom model shares the registry model's weights blob, so that blob must stay.
-        reclaim = [registry[0]] + [b for b in registry[1:] if b not in custom]
-        old = truth['created'] - 90 * DAY
-        for path in reclaim:
-            truth['rebuildable'].append({'path': path, 'cmd': 'ollama pull all-minilm', 'cwd': HOME,
-                                         'project': None, 'mtime': old, 'eligible': True, 'bytes': 0})
-            truth['backdate'].append([path, old])
-        truth['manifest_roots'].append(OLLAMA_MODELS)
-        truth['models']['ollama'] = {'registry': 'all-minilm', 'custom': 'judge-custom',
-                                     'custom_files': custom, 'reclaimable_files': reclaim}
+        pulled = {m: ollama_files(m) for m in (OLLAMA_BASE, OLLAMA_SPARE)}
     except Exception as e:
         truth['models']['ollama'] = f'not measured: {e}'
+        return
+    try:
+        if made.returncode:
+            raise RuntimeError(f'ollama create exited {made.returncode}: {(made.stdout + made.stderr)[-800:]}')
+        custom = ollama_files('judge-custom')
+    except Exception as e:  # the pulled models still count as stock; only the custom-model check is lost
+        custom, why = [], f'not measured: {e}'
+    old = truth['created'] - 90 * DAY
+    reclaim = []
+    for m, files in pulled.items():
+        for path in files:
+            if path not in custom and path not in reclaim:  # blobs the custom model shares must stay
+                reclaim.append(path)
+                add_rebuildable(truth, path, f'ollama pull {m}', HOME, 'ollama model', mtime=old)
+    if not custom:
+        truth['models']['ollama'] = why
+        return
+    truth['manifest_roots'].append(OLLAMA_MODELS)
+    truth['protected'] += [{'path': p, 'why': 'ollama create model'} for p in custom]
+    truth['models']['ollama'] = {'registry': [OLLAMA_BASE, OLLAMA_SPARE], 'custom': 'judge-custom',
+                                 'custom_files': custom, 'reclaimable_files': reclaim}
 
 
 def huggingface(truth):
@@ -497,10 +615,8 @@ def huggingface(truth):
         path = os.path.join(HF_CACHE, 'models--' + HF_REPO.replace('/', '--'))
         if not os.path.isdir(path):
             raise RuntimeError(f'no cache folder at {path}')
-        old = truth['created'] - 90 * DAY
-        truth['rebuildable'].append({'path': path, 'cmd': f'huggingface_hub.snapshot_download("{HF_REPO}")',
-                                     'cwd': HOME, 'project': None, 'mtime': old, 'eligible': True, 'bytes': 0})
-        truth['backdate'].append([path, old])
+        add_rebuildable(truth, path, f'huggingface_hub.snapshot_download("{HF_REPO}")', HOME, 'HF snapshot',
+                        mtime=truth['created'] - 90 * DAY)
         truth['models']['hf'] = {'repo': HF_REPO, 'path': path}
     except Exception as e:
         truth['models']['hf'] = f'not measured: {e}'
@@ -576,6 +692,107 @@ def docker(truth):
         truth['errors'].append(f'docker VM disk fixture: {e}')
 
 
+def pick_ios_runtime(runtimes):
+    """(runtime, iPhone device type) for the newest available iOS runtime, or None."""
+    def iphones(r):
+        return [t['identifier'] for t in r.get('supportedDeviceTypes', []) if t.get('productFamily') == 'iPhone']
+    ios = [r for r in runtimes if r.get('platform') == 'iOS' and r.get('isAvailable') and iphones(r)]
+    if not ios:
+        return None
+    rt = max(ios, key=lambda r: ([int(x) for x in re.findall(r'\d+', r.get('version', ''))], len(iphones(r))))
+    return rt['identifier'], iphones(rt)[0]
+
+
+SIM_PAYLOAD = 'data/Containers/Data/Application/6F0B2D9E-4C1A-4E8B-9A57-2C3D4E5F6A7B/Documents/test-data.bin'
+
+
+def simulators(truth, ratio):
+    """Two cold iOS simulators (never booted, backdated, holding test data) and the newest device
+    of the same type, which must stay. No iOS runtime on the runner: not measured."""
+    try:
+        r = subprocess.run(['xcrun', 'simctl', 'list', 'runtimes', '-j'], capture_output=True, text=True, timeout=300)
+        pick = pick_ios_runtime(json.loads(r.stdout).get('runtimes', [])) if r.returncode == 0 else None
+        if not pick:
+            truth['stock']['simulators'] = 'not measured: no iOS simulator runtime on this runner'
+            return
+        runtime, devtype = pick
+        made = []
+        for name, days, size in (('judge-cold-1', 75, stock_size('simulator', ratio)),
+                                 ('judge-cold-2', 140, stock_size('simulator', ratio)), ('judge-newest', 0, 16 * MB)):
+            c = subprocess.run(['xcrun', 'simctl', 'create', name, devtype, runtime], capture_output=True, text=True,
+                               timeout=300)
+            if c.returncode:
+                raise RuntimeError(f'simctl create {name}: {c.stderr.strip()}')
+            dev = os.path.join(SIM_DEVICES, c.stdout.strip())
+            if not os.path.exists(os.path.join(dev, 'device.plist')):
+                raise RuntimeError(f'simctl create {name} left no device at {dev}')
+            made.append((name, days, dev, fill(os.path.join(dev, SIM_PAYLOAD), size)))
+    except Exception as e:
+        truth['stock']['simulators'] = f'not measured: {e}'
+        return
+    for name, days, dev, payload in made:
+        if days:
+            add_rebuildable(truth, dev, f'xcrun simctl create {name} {devtype} {runtime}', HOME, 'simulator',
+                            restore='simulator', mtime=truth['created'] - days * DAY,
+                            sim={'name': name, 'type': devtype, 'runtime': runtime})
+        else:  # CoreSimulator may rewrite device.plist; the test data is what must stay
+            truth['protected'].append({'path': dev, 'why': 'newest simulator of its type'})
+            truth['manifest_roots'].append(payload)
+    truth['stock']['simulators'] = {'runtime': runtime, 'type': devtype}
+
+
+MACHO = b'\xcf\xfa\xed\xfe'  # 64-bit Mach-O magic, so the fake versions look like binaries
+
+
+def claude_cli(truth, ratio):
+    """Old Claude Code versions (may go) next to the current one the launcher points at (kept)."""
+    if os.path.lexists(CLAUDE_BIN) or os.path.exists(CLAUDE_VERSIONS):
+        truth['stock']['claude_cli'] = 'not measured: Claude Code is already installed on this runner'
+        return
+    size = stock_size('claude_version', ratio)
+    for v, days in (('1.0.100', 150), ('1.0.110', 100), ('1.0.120', 45)):
+        path = fill(os.path.join(CLAUDE_VERSIONS, v), size, MACHO)
+        os.chmod(path, 0o755)
+        add_rebuildable(truth, path, f'claude install {v}', HOME, 'Claude Code version', restore='none',
+                        mtime=truth['created'] - days * DAY)
+    current = fill(os.path.join(CLAUDE_VERSIONS, '1.0.130'), size, MACHO)
+    os.chmod(current, 0o755)
+    os.makedirs(os.path.dirname(CLAUDE_BIN), exist_ok=True)
+    os.symlink(current, CLAUDE_BIN)
+    truth['protected'] += [{'path': current, 'why': 'current Claude Code version'},
+                           {'path': CLAUDE_BIN, 'why': 'Claude Code launcher'}]
+    truth['manifest_roots'] += [current, CLAUDE_BIN]
+    truth['stock']['claude_cli'] = {'versions': CLAUDE_VERSIONS, 'current': current}
+
+
+def electron_cache(truth, ratio):
+    """Claude desktop's Chromium caches (may go only while Claude is not running) and its app
+    data (kept)."""
+    if os.path.exists(CLAUDE_DESKTOP):
+        truth['stock']['electron'] = 'not measured: Claude desktop data already exists on this runner'
+        return
+    running = subprocess.run(['pgrep', '-x', 'Claude'], capture_output=True).returncode == 0
+    for top, sub, kind, name in (('Cache', 'Cache_Data', 'electron_cache', 'f_{:06x}'),
+                                 ('Code Cache', 'js', 'electron_code_cache', '{:016x}_0')):
+        total = stock_size(kind, ratio)
+        n = max(1, total // (8 * MB))
+        for i in range(n):
+            fill(os.path.join(CLAUDE_DESKTOP, top, sub, name.format(i + 1)), total // n)
+        write(os.path.join(CLAUDE_DESKTOP, top, sub), 'index', 'judge fixture\n')
+        if running:  # in use: hashed like any other protected file
+            truth['protected'].append({'path': os.path.join(CLAUDE_DESKTOP, top), 'why': 'Claude is running'})
+        else:
+            add_rebuildable(truth, os.path.join(CLAUDE_DESKTOP, top), 'refilled by Claude on its next launch', HOME,
+                            'Electron cache', restore='none', mtime=truth['created'] - 30 * DAY)
+    data = [write(CLAUDE_DESKTOP, 'claude_desktop_config.json', '{"mcpServers": {}}\n'),
+            write(CLAUDE_DESKTOP, 'Preferences', '{"judge": "fixture"}\n'),
+            write(CLAUDE_DESKTOP, 'Local Storage/leveldb/000003.log', 'judge fixture: keep\n'),
+            write(CLAUDE_DESKTOP, 'IndexedDB/https_claude.ai_0.indexeddb.leveldb/000003.log', 'judge fixture: keep\n')]
+    truth['manifest_roots'].append(CLAUDE_DESKTOP)
+    truth['protected'] += [{'path': p, 'why': 'Claude desktop app data'} for p in data]
+    truth['stock']['electron'] = {'app': 'Claude', 'running': running}
+
+
 def history(truth):
     """Agent chat history: never reclaimable, whatever its size."""
     lines = {os.path.join(HOME, '.claude/projects/x/a.jsonl'): {'type': 'user', 'message': {'role': 'user', 'content': 'judge fixture, keep'}},
@@ -622,7 +839,7 @@ def main(argv=None):
     p.add_argument('--force-local', action='store_true', help='run outside GitHub Actions anyway')
     a = p.parse_args(argv)
     if os.environ.get('GITHUB_ACTIONS') != 'true' and not a.force_local:
-        sys.exit('world.py installs software and rewrites ~/.claude, ~/.codex and VS Code settings: CI only')
+        sys.exit('world.py installs software and rewrites ~/.claude, ~/.codex, ~/.local and ~/Library: CI only')
     root = os.path.abspath(os.path.expanduser(a.root))
     if os.path.exists(root):
         sys.exit(f'{root} exists; the world must start empty')
@@ -636,8 +853,8 @@ def main(argv=None):
              'scale': {'ratio': round(ratio, 3), 'counts': c, 'full_counts': FULL, 'free_bytes_at_start': free,
                        'full_projects': sum(FULL.values()) + TRAPS + int(a.tauri)},
              'projects': [], 'rebuildable': [], 'keep_files': [], 'manifest_roots': [root, REMOTES],
-             'backdate': [], 'recent_paths': [], 'models': {}, 'docker': None, 'dev_server': None,
-             'vscode_storage': None, 'history': [], 'errors': []}
+             'backdate': [], 'recent_paths': [], 'protected': [], 'models': {}, 'stock': {}, 'docker': None,
+             'dev_server': None, 'vscode_storage': None, 'history': [], 'errors': []}
     os.makedirs(root)
     print(f'free {free / GB:.1f} GB -> scale {ratio:.2f}: {c}', flush=True)
 
@@ -661,6 +878,15 @@ def main(argv=None):
     add_project(truth, 'py-nomanifest', 'trap', 'cold', 180, nomanifest_venv)
     if a.tauri:
         add_project(truth, 'tauri-app', 'tauri', 'cold', 100, tauri)
+    template = None
+    for k in range(c['dupe']):
+        copy = add_project(truth, f'dupe-{k + 1:02d}', 'dupe', 'cold', 70 + 17 * k, dupe, template)
+        template = template or (copy and copy['path'])
+    for k in range(c['rustbig']):
+        add_project(truth, f'rustbig-{k + 1:02d}', 'rust', 'cold', 80 + 23 * k, rust, RUST_BIG)
+    simulators(truth, ratio)
+    claude_cli(truth, ratio)
+    electron_cache(truth, ratio)
     ollama(truth)
     huggingface(truth)
     docker(truth)
@@ -678,7 +904,9 @@ def main(argv=None):
         json.dump(truth, f, indent=2)
     total = sum(e['bytes'] for e in truth['rebuildable'])
     print(f'{len(truth["projects"])} projects, {total / GB:.2f} GB rebuildable, '
-          f'{len(truth["errors"])} errors, models: {truth["models"]}, dev server: {truth["dev_server"]}')
+          f'{len(truth["errors"])} errors, dev server: {truth["dev_server"]}')
+    for k, v in list(truth['models'].items()) + list(truth['stock'].items()):
+        print(f'{k}: {v if isinstance(v, str) else "set up"}')
     for err in truth['errors']:
         print(f'error: {err}')
     return 0 if truth['projects'] else 1

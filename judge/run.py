@@ -226,34 +226,120 @@ def verify(truth):
 
 def eligible(truth):
     """Rebuildable entries still on disk that nothing protects: no keep file inside, not in a
-    protected (busy, untracked work, ...) or recently opened path."""
-    blocked = list(truth['recent_paths']) + [x['path'] for p in truth['projects'] for x in p.get('protected', [])]
+    protected (busy, untracked work, newest simulator, ...) or recently opened path."""
+    blocked = list(truth['recent_paths']) + [x['path'] for x in protected_list(truth)]
     return [e for e in truth['rebuildable']
             if e['eligible'] and os.path.lexists(e['path'])
             and not any(world.inside(e['path'], b) for b in blocked)
             and not any(world.inside(k, e['path']) for k in truth['keep_files'])]
 
 
-def eligible_numbers(truth):
-    paths = [e['path'] for e in eligible(truth)]
-    return {'eligible_bytes': world.alloc_bytes(*paths), 'eligible_items': len(paths)}
+def protected_list(truth):
+    return [x for p in truth['projects'] for x in p.get('protected', [])] + truth.get('protected', [])
+
+
+def sized_eligible(truth):
+    """Eligible entries with their allocated bytes; a hard link shared by two entries counts once."""
+    seen = set()
+    return [{'path': e['path'], 'kind': e.get('kind') or os.path.basename(e['path']),
+             'bytes': world.alloc_bytes(e['path'], seen=seen)} for e in eligible(truth)]
+
+
+def eligible_numbers(sized):
+    return {'eligible_bytes': sum(x['bytes'] for x in sized), 'eligible_items': len(sized)}
+
+
+def protected_bytes(truth):
+    """{why: {items, bytes}} for what the judge keeps: protected paths and rebuildable entries
+    that are not eligible (hand-edited, app running, ...)."""
+    ok = {e['path'] for e in eligible(truth)}
+    items = [(x['path'], x['why']) for x in protected_list(truth)]
+    items += [(e['path'], e.get('why', 'not eligible')) for e in truth['rebuildable'] if e['path'] not in ok]
+    out, seen = {}, set()
+    for path, why in items:
+        if os.path.lexists(path):
+            r = out.setdefault(why, {'items': 0, 'bytes': 0})
+            r['items'] += 1
+            r['bytes'] += world.alloc_bytes(path, seen=seen)
+    return out
+
+
+def read_history(home):
+    """Headroom's action records (HEADROOM_HOME/history.jsonl); used only to explain the gap."""
+    try:
+        with open(os.path.join(home, 'history.jsonl')) as f:
+            return [r for r in (parse_json(line) for line in f if line.strip()) if isinstance(r, dict)]
+    except OSError:
+        return []
+
+
+def gap(sized, gone, protected, history, tracked):
+    """Where the bytes went. sized: eligible entries measured before clean; gone: paths clean
+    removed; protected: protected_bytes(); history: Headroom's records of this clean; tracked:
+    every path the judge lists (rebuildable or protected)."""
+    def total(rows, size):
+        return {'bytes': sum(size(r) for r in rows), 'items': len(rows)}
+
+    def kinds(rows):
+        n = {}
+        for r in rows:
+            n[str(r.get('kind'))] = n.get(str(r.get('kind')), 0) + 1
+        return n
+    freed = [x for x in sized if x['path'] in gone]
+    kept = [x for x in sized if x['path'] not in gone]
+    not_counted = [h for h in history if h.get('frees_host') is False]
+    other = [h for h in history if h.get('frees_host') is not False
+             and not any(world.inside(str(h.get('path')), t) or world.inside(t, str(h.get('path'))) for t in tracked)]
+    return {'eligible_freed': total(freed, lambda x: x['bytes']),
+            'eligible_kept': dict(total(kept, lambda x: x['bytes']), kinds=kinds(kept), paths=kept),
+            'protected': {'bytes': sum(v['bytes'] for v in protected.values()),
+                          'items': sum(v['items'] for v in protected.values()), 'by_reason': protected},
+            'not_counted': dict(total(not_counted, lambda h: num(h.get('bytes'))), kinds=kinds(not_counted)),
+            'other_freed': dict(total(other, lambda h: num(h.get('bytes'))), kinds=kinds(other),
+                                paths=[str(h.get('path')) for h in other][:20])}
+
+
+def simctl_devices():
+    try:
+        r = subprocess.run(['xcrun', 'simctl', 'list', 'devices', '-j'], capture_output=True, text=True, timeout=300)
+        return json.loads(r.stdout).get('devices', {})
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return {}
+
+
+def restored(e, devices):
+    """Did rebuild bring a deleted entry back the way truth.json says it must come back?"""
+    how = e.get('restore', 'path')
+    if how == 'none':  # a cache its app refills, an old version: nothing needs it back
+        return True
+    if how == 'simulator':  # undo makes a new, blank device: same name, type and runtime
+        s = e['sim']
+        return any(d.get('name') == s['name'] and d.get('deviceTypeIdentifier') == s['type']
+                   for d in devices.get(s['runtime'], []))
+    return os.path.lexists(e['path'])
 
 
 def safety_reclaim(hr, truth, out):
     dev = truth.get('dev_server') or {}
     dev_up = bool(dev.get('pid')) and alive(dev['pid'])
     m0 = snap(truth, out, '0-before')
-    present = [e['path'] for e in truth['rebuildable'] if os.path.lexists(e['path'])]
-    before = eligible_numbers(truth)  # measured right before clean
+    present = [e for e in truth['rebuildable'] if os.path.lexists(e['path'])]
+    sized = sized_eligible(truth)  # measured right before clean
+    protected = protected_bytes(truth)
+    home = hr.env['HEADROOM_HOME']
+    known = len(read_history(home))
     f0 = settle_free()
     rc_clean, so = hr.run(['clean', truth['root'], '--apply', '--json'], timeout=3600)
     f1 = settle_free()
     claimed = parse_json(so)
+    gone = {x['path'] for x in sized if not os.path.lexists(x['path'])}
+    history = read_history(home)[known:]
     after_clean, bad_clean = compare(m0, snap(truth, out, '1-after-clean'))
-    deleted = [p for p in present if not os.path.lexists(p)]
+    deleted = [e for e in present if not os.path.lexists(e['path'])]
     rc_rebuild, _ = hr.run(['rebuild', '--all'], sandbox=False, timeout=5400)
     after_rebuild, bad_rebuild = compare(m0, snap(truth, out, '2-after-rebuild'))
-    not_rebuilt = [p for p in deleted if not os.path.lexists(p)]
+    devices = simctl_devices() if any(e.get('restore') == 'simulator' for e in deleted) else {}
+    not_rebuilt = [e['path'] for e in deleted if not restored(e, devices)]
     failed = verify(truth)
     dev_killed = dev_up and not alive(dev['pid'])
     problems = [msg for bad, msg in [
@@ -261,7 +347,7 @@ def safety_reclaim(hr, truth, out):
         (bad_clean, 'clean lost or changed files that must survive'),
         (rc_rebuild, f'rebuild exited {rc_rebuild}'),
         (bad_rebuild, 'files lost or changed after rebuild'),
-        (not_rebuilt, f'{len(not_rebuilt)} deleted folders not rebuilt'),
+        (not_rebuilt, f'{len(not_rebuilt)} deleted items not rebuilt'),
         (failed, 'build failed after rebuild: ' + ', '.join(failed)),
         (dev_killed, 'the running dev server was killed')] if bad]
     safety = row('1 Safety', FAIL if problems else PASS, {
@@ -270,14 +356,24 @@ def safety_reclaim(hr, truth, out):
         'verify_failed': failed, 'dev_server_up_at_start': dev_up}, '; '.join(problems))
 
     freed = f1 - f0
+    before = eligible_numbers(sized)
     share, status = reclaim_verdict(freed, before['eligible_bytes'])
     reason = {PASS: '', NOT: 'nothing eligible to reclaim in this world',
               FAIL: f'freed {share:.0%} of the eligible bytes, needs {RECLAIM_SHARE:.0%}' if share is not None else ''}
     reclaim = row('2 Reclaim', status, dict(
         before, freed_bytes=freed, freed_share=share,
         claimed_bytes=claimed.get('freed_bytes') if isinstance(claimed, dict) else None,
-        clean_json_ok=isinstance(claimed, dict)), reason[status])
+        clean_json_ok=isinstance(claimed, dict), **not_measured(truth)), reason[status])
+    tracked = [e['path'] for e in truth['rebuildable']] + [x['path'] for x in protected_list(truth)]
+    reclaim['gap'] = gap(sized, gone, protected, history, tracked)
     return [safety, reclaim]
+
+
+def not_measured(truth):
+    """Stock the runner could not provide (no iOS runtime, ...), so it is honestly absent."""
+    miss = [f'{k}: {v}' for k, v in list(truth.get('stock', {}).items()) + list(truth.get('models', {}).items())
+            if isinstance(v, str)]
+    return {'not_measured': miss} if miss else {}
 
 
 def signature(paths):
@@ -504,7 +600,7 @@ def missing(why, truth):
     rows = [row(g, FAIL, reason=why) for g in GATES]
     if truth:  # still show what a cleaner could have taken
         try:
-            rows[1]['numbers'] = eligible_numbers(truth)
+            rows[1]['numbers'] = dict(eligible_numbers(sized_eligible(truth)), **not_measured(truth))
         except (KeyError, TypeError) as e:
             rows[1]['numbers'] = {'eligible_error': repr(e)}
     return rows
@@ -541,8 +637,36 @@ def markdown(rep):
     for r in rep['gates']:
         nums = ', '.join(f'{k}={fmt(k, v)}' for k, v in r['numbers'].items())
         cells = [r['gate'], r['status'], nums, r['reason']]
-        lines.append('| ' + ' | '.join(c.replace('|', '\\|').replace('\n', ' ') for c in cells) + ' |')
+        lines.append(table_row(cells))
+    for r in rep['gates']:
+        if r.get('gap'):
+            lines += gap_markdown(r['gap'])
     return '\n'.join(lines) + '\n'
+
+
+def table_row(cells):
+    return '| ' + ' | '.join(str(c).replace('|', '\\|').replace('\n', ' ') for c in cells) + ' |'
+
+
+def gap_markdown(g):
+    def gb(b):
+        return f'{b / GB:.3f} GB'
+
+    def kinds(k):
+        return ', '.join(f'{n} x{c}' if c > 1 else n for n, c in sorted(k.items()))
+    kept, prot = g['eligible_kept'], g['protected']
+    rows = [('eligible, freed', g['eligible_freed'], ''),
+            ('eligible, kept', kept, kinds(kept['kinds'])),
+            ('protected', prot, ', '.join(f'{why} {gb(v["bytes"])} ({v["items"]})'
+                                          for why, v in sorted(prot['by_reason'].items()))),
+            ('freed, not counted (frees_host false)', g['not_counted'], kinds(g['not_counted']['kinds'])),
+            ("freed, not in the judge's lists", g['other_freed'], kinds(g['other_freed']['kinds']))]
+    lines = ['', '### Reclaim gap', '', '| Bucket | Size | Items | Detail |', '|---|---|---|---|']
+    lines += [table_row([name, gb(b['bytes']), b['items'], detail]) for name, b, detail in rows]
+    if kept['paths']:
+        lines += ['', 'Eligible but kept:'] + [f"- `{x['path']}` ({x['kind']}, {gb(x['bytes'])})"
+                                                for x in kept['paths'][:20]]
+    return lines
 
 
 def load(path):
