@@ -122,22 +122,35 @@ fn derived_data_follows_its_projects_activity() {
     let mut ctx = ctx("m-derived");
     ctx.machine = true;
     let dd = ctx.home.join("Library/Developer/Xcode/DerivedData");
-    let mk = |name: &str, when: u64| {
-        let proj = ctx.home.join("code").join(name);
+    // Like the judge's world: the folder is named after the package folder (swift-01), the
+    // scheme is the package's (SwiftAlpha); Xcode's build log index says which scheme built it.
+    let mk = |folder: &str, scheme: &str, when: u64| {
+        let proj = ctx.home.join("code").join(folder);
         write(&proj.join("Package.swift"), "// swift-tools-version:5.9\n");
         git(&proj, &["init", "-q"], Some(when));
         git(&proj, &["add", "-A"], Some(when));
         git(&proj, &["commit", "-qm", "c"], Some(when));
-        let d = dd.join(format!("{name}-abcdefghijkl"));
+        let d = dd.join(format!("{folder}-abcdefghijkl"));
         write(
             &d.join("info.plist"),
             &format!("<plist><dict><key>WorkspacePath</key>\n<string>{}</string></dict></plist>", proj.display()),
         );
+        let log = |id: &str, name: &str, stop: f64| {
+            format!("<key>{id}</key><dict><key>schemeIdentifier-schemeName</key><string>{name}</string><key>timeStoppedRecording</key><real>{stop}</real></dict>")
+        };
+        write(
+            &d.join("Logs/Build/LogStoreManifest.plist"),
+            &format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>logs</key><dict>{}{}</dict></dict></plist>",
+                log("A", "OldScheme", 1000.0),
+                log("B", scheme, 2000.0)
+            ),
+        );
         std::fs::create_dir_all(d.join("Build/Products/Debug")).unwrap();
         (proj, d)
     };
-    let (cold_proj, cold) = mk("SwiftAlpha", OLD);
-    let (_, warm) = mk("SwiftBravo", ctx.now - 2 * DAY);
+    let (cold_proj, cold) = mk("swift-01", "SwiftAlpha", OLD);
+    let (_, warm) = mk("swift-02", "SwiftBravo", ctx.now - 2 * DAY);
     std::fs::create_dir_all(dd.join("ModuleCache.noindex")).unwrap();
     let mut c = discover(&ctx, Some("DerivedData"));
     judge(&ctx, &mut c, Some(&[]));
@@ -152,35 +165,46 @@ fn derived_data_follows_its_projects_activity() {
 }
 
 #[test]
-fn hugging_face_needs_a_cli_to_come_back() {
+fn hugging_face_comes_back_with_its_exact_revision_files_and_refs() {
     let mut ctx = ctx("m-hf");
     ctx.machine = true;
     let repo = ctx.home.join(".cache/huggingface/hub/models--org--tiny");
-    write(&repo.join("refs/main"), "abc123");
+    write(&repo.join("refs/main"), "abc123\n");
     write(&repo.join("blobs/b1"), "weights");
     std::fs::create_dir_all(repo.join("snapshots/abc123")).unwrap();
     std::os::unix::fs::symlink("../../blobs/b1", repo.join("snapshots/abc123/model.bin")).unwrap();
-    for p in [repo.join("refs/main"), repo.join("blobs/b1")] {
-        touch(&p, OLD);
-    }
+    // Old like the judge's fixture: every entry, symlinks themselves included (`touch -h`).
+    let ok = std::process::Command::new("/usr/bin/find")
+        .arg(&repo)
+        .args(["-exec", "/usr/bin/touch", "-h", "-t", "202009130000", "{}", "+"])
+        .status()
+        .unwrap();
+    assert!(ok.success());
+    // Without python3 there is no way back: kept.
+    ctx.path_var = "/nonexistent".into();
     let mut c = discover(&ctx, Some("hf_model"));
     judge(&ctx, &mut c, Some(&[]));
-    assert!(c[0].blocked.as_deref().unwrap().contains("huggingface-cli"));
-    let bin = ctx.home.join("bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    script(&bin.join("hf"), "exit 0");
-    ctx.path_var = format!("{}:/usr/bin", bin.display());
+    assert!(c[0].blocked.as_deref().unwrap().contains("python3"));
+    // No hf CLI needed (the judge's world has none): python3 is enough. Newer huggingface_hub
+    // links blobs into a store shared by every repo (hub/blobs/xx/…), written just now: that
+    // store isn't this folder, so its times don't make the snapshot look used.
+    let store = ctx.home.join(".cache/huggingface/hub/blobs/f0/f094");
+    write(&store, "shared content");
+    std::os::unix::fs::symlink(&store, repo.join("blobs/b2")).unwrap();
+    let ok = std::process::Command::new("/usr/bin/touch")
+        .args(["-h", "-t", "202009130000"])
+        .args([repo.join("blobs/b2"), repo.join("blobs")])
+        .status();
+    assert!(ok.unwrap().success());
+    ctx.path_var = "/usr/bin:/bin".into();
     let mut c = discover(&ctx, Some("hf_model"));
-    // The snapshot symlinks were made just now; blob access times keep it warm until they age.
-    c[0].active = Some(OLD);
-    c[0].recent_rule = false;
     judge(&ctx, &mut c, Some(&[]));
     assert!(c[0].reclaimable(), "{}", c[0].reason());
-    let step = c[0].plan.as_ref().unwrap().steps[0].join(" ");
-    assert!(
-        step.starts_with("hf download org/tiny model.bin --revision abc123 --repo-type model --cache-dir "),
-        "{step}"
-    );
+    let steps = &c[0].plan.as_ref().unwrap().steps;
+    assert_eq!(steps[0][..3], ["python3", "-m", "venv"]);
+    let last = &steps[2];
+    assert_eq!(last[3..6], ["org/tiny", "model", &*ctx.home.join(".cache/huggingface/hub").to_string_lossy()]);
+    assert_eq!(last[6..], ["abc123", r#"{"main":"abc123"}"#, "model.bin"]);
 }
 
 #[test]
@@ -189,8 +213,13 @@ fn ai_history_is_never_reclaimable_and_never_deletable() {
     ctx.machine = true;
     write(&ctx.home.join(".claude/projects/x/a.jsonl"), "{}\n");
     write(&ctx.home.join(".codex/sessions/a.jsonl"), "{}\n");
-    write(&ctx.home.join(".local/share/claude/versions/2.1.9"), "old binary");
-    write(&ctx.home.join(".local/share/claude/versions/2.1.10"), "newest binary");
+    for v in ["2.1.8", "2.1.9", "2.1.10", "2.1.11"] {
+        write(&ctx.home.join(".local/share/claude/versions").join(v), "binary");
+    }
+    // The launcher points at 2.1.9 (not the newest): both it and 2.1.11 stay.
+    std::fs::create_dir_all(ctx.home.join(".local/bin")).unwrap();
+    std::os::unix::fs::symlink(ctx.home.join(".local/share/claude/versions/2.1.9"), ctx.home.join(".local/bin/claude"))
+        .unwrap();
     let mut c = discover(&ctx, Some("ai_history"));
     judge(&ctx, &mut c, Some(&[]));
     let hist: Vec<&Cand> = c.iter().filter(|x| x.kind == "ai_history").collect();
@@ -205,7 +234,7 @@ fn ai_history_is_never_reclaimable_and_never_deletable() {
         .filter(|x| x.kind == "claude_code_old")
         .map(|x| x.path.file_name().unwrap().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(old, ["2.1.9"], "the newest version stays");
+    assert_eq!(old, ["2.1.8", "2.1.10"], "the current and the newest versions stay");
 }
 
 #[test]
@@ -241,4 +270,193 @@ fn xcode_leftovers_keep_the_newest_device_support_and_recent_archives() {
     assert!(old.blocked.as_deref().unwrap_or("").contains("archives can't be rebuilt"), "{:?}", old.blocked);
     assert!(crate::reclaim::reclaim(&ctx, old, "clean").is_err());
     assert!(old.path.exists());
+}
+
+fn sim(udid: &str, name: &str, state: &str, last_used: Option<&str>, available: bool) -> Json {
+    let mut d = obj! {
+        "udid" => udid, "name" => name, "state" => state, "isAvailable" => available,
+        "deviceTypeIdentifier" => "com.apple.CoreSimulator.SimDeviceType.iPhone-16",
+        "runtime" => "com.apple.CoreSimulator.SimRuntime.iOS-18-2",
+    };
+    if let Some(t) = last_used {
+        d.set("lastUsedAt", t);
+    }
+    d
+}
+
+#[test]
+fn cold_simulators_go_but_never_booted_recent_or_the_newest_of_their_type() {
+    let mut ctx = ctx("m-sims");
+    ctx.machine = true;
+    let dir = ctx.home.join("Library/Developer/CoreSimulator/Devices");
+    let u = |n: u8| format!("{:08X}-0000-4000-8000-{:012X}", n, n);
+    let devices = vec![
+        sim(&u(1), "cold-1", "Shutdown", None, true), // never used, made 140 days ago
+        sim(&u(2), "cold-2", "Shutdown", None, true), // never used, made 75 days ago
+        sim(&u(3), "newest", "Shutdown", None, true), // made today: the newest
+        sim(&u(4), "booted", "Booted", None, true),   // made long ago but running
+        sim(&u(5), "used", "Shutdown", Some("2020-01-01T00:00:00Z"), true), // old use stamp
+        sim(&u(6), "gone-runtime", "Shutdown", None, false), // its runtime is gone
+    ];
+    for (i, days) in [(1, 140), (2, 75), (3, 0), (4, 200), (5, 300), (6, 10)] {
+        let d = dir.join(u(i));
+        write(&d.join("data/Containers/Data/Application/X/Documents/test-data.bin"), "test data");
+        write(&d.join("device.plist"), "<plist/>");
+        if days > 0 {
+            for p in [d.join("device.plist"), d.clone()] {
+                touch(&p, ctx.now - days * DAY);
+            }
+        }
+    }
+    let cache = obj! {"at" => crate::state::wall_clock(), "devices" => devices};
+    crate::state::write_atomic(&ctx.file("cache-simctl.json"), cache.to_string().as_bytes()).unwrap();
+    let mut c = simulators(&ctx, false);
+    for x in &mut c {
+        x.machine = true;
+    }
+    judge(&ctx, &mut c, Some(&[]));
+    let by = |n: u8| c.iter().find(|x| x.path == dir.join(u(n))).unwrap();
+    for n in [1, 2] {
+        let x = by(n);
+        assert!(x.reclaimable(), "{}", x.reason());
+        assert!(x.bytes > 0, "sized: private bytes of the device folder");
+        assert!(x.reason().contains("test data are deleted"), "{}", x.reason());
+        let p = x.plan.as_ref().unwrap();
+        assert!(p.new_device && !p.loss.is_empty());
+        assert_eq!(
+            p.steps[0].join(" "),
+            format!("xcrun simctl create cold-{n} com.apple.CoreSimulator.SimDeviceType.iPhone-16 com.apple.CoreSimulator.SimRuntime.iOS-18-2")
+        );
+    }
+    assert!(by(3).blocked.as_deref().unwrap().contains("newest"), "{:?}", by(3).blocked);
+    assert!(by(4).blocked.as_deref().unwrap().contains("booted"), "{:?}", by(4).blocked);
+    assert!(by(5).reclaimable(), "an old lastUsedAt counts: {}", by(5).reason());
+    assert!(by(6).reclaimable(), "{}", by(6).reason());
+    // Used ten days ago: kept for 30 days.
+    let mut recent = devices_with_use(&ctx, &u(2), 10);
+    judge(&ctx, &mut recent, Some(&[]));
+    let x = recent.iter().find(|x| x.path == dir.join(u(2))).unwrap();
+    assert!(x.blocked.as_deref().unwrap().contains("used 10 days ago"), "{:?}", x.blocked);
+}
+
+/// The cached device list with one device's lastUsedAt set `days` ago.
+fn devices_with_use(ctx: &Ctx, udid: &str, days: u64) -> Vec<Cand> {
+    let mut j = crate::state::read_json(&ctx.file("cache-simctl.json")).unwrap();
+    let mut list = j.get("devices").unwrap().arr().to_vec();
+    let t = ctx.now - days * DAY;
+    let stamp = format!("{}T00:00:00Z", civil(t));
+    for d in &mut list {
+        if d.s("udid") == udid {
+            d.set("lastUsedAt", stamp.as_str());
+        }
+    }
+    j.set("devices", Json::Arr(list));
+    crate::state::write_atomic(&ctx.file("cache-simctl.json"), j.to_string().as_bytes()).unwrap();
+    let mut c = simulators(ctx, false);
+    for x in &mut c {
+        x.machine = true;
+    }
+    c
+}
+
+/// Seconds since 1970 -> "YYYY-MM-DD" (UTC), by search: test-only.
+fn civil(t: u64) -> String {
+    let mut y = 1970;
+    while date_secs(&format!("{}-01-01", y + 1)).is_some_and(|s| s <= t) {
+        y += 1;
+    }
+    let mut m = 1;
+    while m < 12 && date_secs(&format!("{y}-{:02}-01", m + 1)).is_some_and(|s| s <= t) {
+        m += 1;
+    }
+    let d = 1 + (t - date_secs(&format!("{y}-{m:02}-01")).unwrap()) / DAY;
+    format!("{y}-{m:02}-{d:02}")
+}
+
+#[test]
+fn undoing_a_simulator_makes_a_blank_one_with_the_same_name_type_and_runtime() {
+    let mut ctx = ctx("m-sim-undo");
+    // Outside home: the rebuild never runs a tool from inside the folder it works in.
+    let bin = ctx.home.parent().unwrap().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = bin.join("xcrun.log");
+    script(&bin.join("xcrun"), &format!("echo \"$@\" >> '{}'", log.display()));
+    // Only the fake xcrun is reachable: a real `simctl create` must never run from a test.
+    ctx.path_var = bin.to_string_lossy().into_owned();
+    let gone = ctx.home.join("Library/Developer/CoreSimulator/Devices/OLD-UDID");
+    let a = obj! {
+        "path" => &gone, "kind" => "simulator", "new_device" => true, "cwd" => &ctx.home,
+        "steps" => vec![Json::Arr(["xcrun", "simctl", "create", "cold-1", "com.apple.CoreSimulator.SimDeviceType.iPhone-16", "com.apple.CoreSimulator.SimRuntime.iOS-18-2"].iter().map(|s| Json::from(*s)).collect())],
+    };
+    let r = crate::rebuild::restore(&ctx, &a);
+    assert!(matches!(r, crate::rebuild::Outcome::Restored(_)), "the old path never comes back; a new device does");
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "simctl create cold-1 com.apple.CoreSimulator.SimDeviceType.iPhone-16 com.apple.CoreSimulator.SimRuntime.iOS-18-2\n");
+}
+
+#[test]
+fn electron_caches_go_only_while_their_app_is_closed_and_app_data_never() {
+    let mut ctx = ctx("m-electron");
+    ctx.machine = true;
+    let support = ctx.home.join("Library/Application Support");
+    for app in ["Claude", "Codex", "Cursor"] {
+        for d in ["Cache/Cache_Data/f_000001", "Code Cache/js/abc_0", "GPUCache/data_0"] {
+            write(&support.join(app).join(d), "cache");
+        }
+        for d in ["Local Storage/leveldb/000003.log", "IndexedDB/x.leveldb/000003.log", "Preferences", "config.json"] {
+            write(&support.join(app).join(d), "user data");
+        }
+    }
+    // A running "Codex": a sleep started through a symlink named Codex.
+    let fake = ctx.home.join("bin/Codex");
+    std::fs::create_dir_all(fake.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("/bin/sleep", &fake).unwrap();
+    let mut codex = std::process::Command::new(&fake).arg("30").spawn().unwrap();
+    let mut c = discover(&ctx, Some("electron_cache"));
+    judge(&ctx, &mut c, Some(&[]));
+    let _ = codex.kill();
+    let _ = codex.wait();
+    let caches: Vec<&Cand> = c.iter().filter(|x| x.kind == "electron_cache").collect();
+    assert_eq!(caches.len(), 9, "Cache, Code Cache and GPUCache of three apps, nothing else");
+    for x in &caches {
+        let name = x.path.file_name().unwrap().to_string_lossy();
+        assert!(["Cache", "Code Cache", "GPUCache"].contains(&&*name), "{}", x.path.display());
+    }
+    let procs = crate::proc::processes().unwrap();
+    for x in &caches {
+        let app = x.path.parent().unwrap().file_name().unwrap().to_string_lossy().into_owned();
+        let up = app == "Codex" || running(&procs, &[&app]);
+        assert_eq!(!x.reclaimable(), up, "{}: {}", x.path.display(), x.reason());
+    }
+    // Deleting a closed app's cache leaves its data alone.
+    if let Some(x) = caches.iter().find(|x| x.reclaimable()) {
+        crate::reclaim::reclaim(&ctx, x, "clean").unwrap();
+        let app = x.path.parent().unwrap();
+        assert!(!x.path.exists());
+        for d in ["Local Storage/leveldb/000003.log", "IndexedDB/x.leveldb/000003.log", "Preferences", "config.json"] {
+            assert_eq!(std::fs::read_to_string(app.join(d)).unwrap(), "user data");
+        }
+    }
+}
+
+#[test]
+fn simctl_create_arguments_cannot_be_options() {
+    let (t, r) = ("com.apple.CoreSimulator.SimDeviceType.iPhone-16", "com.apple.CoreSimulator.SimRuntime.iOS-18-2");
+    assert!(sim_create_ok("iPhone 16", t, r));
+    assert!(!sim_create_ok("-rf", t, r));
+    assert!(!sim_create_ok("  ", t, r));
+    assert!(!sim_create_ok("ok", "--set", r));
+    assert!(!sim_create_ok("ok", t, "com.apple.CoreSimulator.SimRuntime.iOS 18; rm"));
+    // An undo whose recorded command was edited into something else is refused.
+    let mut ctx = ctx("m-sim-tamper");
+    let bin = ctx.home.parent().unwrap().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = bin.join("xcrun.log");
+    script(&bin.join("xcrun"), &format!("echo \"$@\" >> '{}'", log.display()));
+    ctx.path_var = bin.to_string_lossy().into_owned();
+    let a = obj! {
+        "path" => &ctx.home.join("gone"), "kind" => "simulator", "new_device" => true, "cwd" => &ctx.home,
+        "steps" => vec![Json::Arr(["xcrun", "simctl", "create", "-x", t, r].iter().map(|s| Json::from(*s)).collect())],
+    };
+    assert!(matches!(crate::rebuild::restore(&ctx, &a), crate::rebuild::Outcome::Failed(_)));
+    assert!(!log.exists(), "nothing ran");
 }

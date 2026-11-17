@@ -15,7 +15,7 @@ const SOURCES: &[(&[&str], Source)] = &[
     (&["DerivedData"], derived_data),
     (&["device_support", "xcode_archive"], xcode_misc),
     (&["simulator"], simulators),
-    (&["claude_code_old", "codex_temp", "cursor_cache", "ai_history"], ai_leftovers),
+    (&["claude_code_old", "codex_temp", "electron_cache", "ai_history"], ai_leftovers),
     (&["ollama_model"], ollama),
     (&["hf_model"], huggingface),
     (&["lmstudio_model"], lmstudio),
@@ -97,7 +97,8 @@ fn derived_data(ctx: &Ctx, _fresh: bool) -> Vec<Cand> {
     if entries.is_empty() {
         return vec![];
     }
-    let building = running(&proc::processes(), &["xcodebuild", "XCBBuildService", "SWBBuildService"]);
+    let building =
+        proc::processes().map_or(true, |p| running(&p, &["xcodebuild", "XCBBuildService", "SWBBuildService"]));
     let mut out = vec![];
     for p in entries {
         let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
@@ -110,11 +111,16 @@ fn derived_data(ctx: &Ctx, _fresh: bool) -> Vec<Cand> {
         match plist_string(&p.join("info.plist"), "WorkspacePath").map(PathBuf::from) {
             // A package's own .swiftpm workspace is optional: the package folder is enough.
             Some(ws) if ws.exists() || (project_dir(&ws).is_dir() && ws.to_string_lossy().contains("/.swiftpm/")) => {
+                // Real path (Xcode may record /tmp for /private/tmp), so it matches the scan's.
                 let dir = project_dir(&ws);
+                let dir = dir.canonicalize().unwrap_or(dir);
                 c.repo = git::toplevel(&dir);
                 c.project = Some(c.repo.clone().unwrap_or_else(|| dir.clone()));
                 c.why = format!("Xcode build data for {}", ws.display());
-                c.plan = Some(xcode_plan(&p, &ws, &dir, scheme));
+                // The folder is named after the workspace, not the scheme: the scheme of the last
+                // build is in Xcode's build log index.
+                let scheme = last_scheme(&p).unwrap_or_else(|| scheme.to_string());
+                c.plan = Some(xcode_plan(&p, &ws, &dir, &scheme));
             }
             Some(ws) if project_dir(&ws).exists() => {
                 c.blocked = Some(format!("its workspace {} moved: Headroom can't rebuild it", ws.display()));
@@ -128,7 +134,7 @@ fn derived_data(ctx: &Ctx, _fresh: bool) -> Vec<Cand> {
             None => c.blocked = Some("no info.plist: can't tell which project made it".into()),
         }
         if building {
-            c.blocked = Some("Xcode is building right now".into());
+            c.blocked = Some("Xcode is building right now (or ps couldn't tell)".into());
         }
         out.push(c);
     }
@@ -146,6 +152,24 @@ fn project_dir(ws: &Path) -> PathBuf {
         Some("xcodeproj" | "xcworkspace" | "playground") => ws.parent().unwrap_or(ws).into(),
         _ => ws.into(),
     }
+}
+
+/// The scheme of the newest build recorded in DerivedData's Logs/Build/LogStoreManifest.plist.
+fn last_scheme(dd: &Path) -> Option<String> {
+    let mut c = Command::new("/usr/bin/plutil");
+    c.args(["-convert", "json", "-o", "-"]).arg(dd.join("Logs/Build/LogStoreManifest.plist"));
+    let j = proc::run(c, 10).filter(proc::Out::ok).and_then(|o| Json::parse(&o.stdout).ok())?;
+    let Some(Json::Obj(logs)) = j.get("logs") else { return None };
+    let stopped = |l: &Json| match l.get("timeStoppedRecording") {
+        Some(Json::Num(x)) => *x,
+        Some(Json::Int(n)) => *n as f64,
+        _ => 0.0,
+    };
+    logs.iter()
+        .map(|(_, l)| l)
+        .filter(|l| !l.s("schemeIdentifier-schemeName").is_empty())
+        .max_by(|a, b| stopped(a).total_cmp(&stopped(b)))
+        .map(|l| l.s("schemeIdentifier-schemeName").to_string())
 }
 
 fn xcode_plan(dd: &Path, ws: &Path, dir: &Path, scheme: &str) -> Plan {
@@ -230,60 +254,135 @@ fn date_secs(s: &str) -> Option<u64> {
     u64::try_from((era * 146_097 + doe - 719_468) * 86_400).ok()
 }
 
-/// Simulators whose runtime is gone. `xcrun simctl` is slow to start, so the list is cached
-/// for six hours in HEADROOM_HOME; the recheck before delete always asks again.
+/// "2026-11-07T20:34:06Z" (UTC, as simctl prints it) -> seconds since 1970.
+fn iso_secs(s: &str) -> Option<u64> {
+    let day = date_secs(s.get(..10)?)?;
+    let t = s.get(11..19)?;
+    let mut hms = t.split(':').map(|p| p.parse::<u64>().ok());
+    Some(day + hms.next()?? * 3600 + hms.next()?? * 60 + hms.next()??)
+}
+
+pub const SIM_COLD_DAYS: u64 = 30;
+
+/// `simctl create <name> <type> <runtime>` arguments that can't be read as options: a name
+/// that is not empty and doesn't start with '-', and CoreSimulator identifiers.
+pub fn sim_create_ok(name: &str, kind: &str, runtime: &str) -> bool {
+    let id = |s: &str, prefix: &str| {
+        s.strip_prefix(prefix)
+            .is_some_and(|r| !r.is_empty() && r.chars().all(|c| c.is_ascii_alphanumeric() || ".-_".contains(c)))
+    };
+    !name.trim().is_empty()
+        && !name.starts_with('-')
+        && id(kind, "com.apple.CoreSimulator.SimDeviceType.")
+        && id(runtime, "com.apple.CoreSimulator.SimRuntime.")
+}
+
+/// Every simulator device as simctl lists it, each with its runtime. Cached for six hours in
+/// HEADROOM_HOME (simctl is slow to start); the recheck before delete always asks again.
+fn sim_devices(ctx: &Ctx, fresh: bool) -> Option<Vec<Json>> {
+    let cache = ctx.file("cache-simctl.json");
+    if !fresh {
+        let hit = state::read_json(&cache)
+            .filter(|j| j.get("at").and_then(Json::u64).is_some_and(|t| t + 6 * 3600 > state::wall_clock()));
+        if let Some(Json::Arr(d)) = hit.as_ref().and_then(|j| j.get("devices")) {
+            return Some(d.clone());
+        }
+    }
+    let mut c = Command::new("/usr/bin/xcrun");
+    c.args(["simctl", "list", "devices", "-j"]);
+    let j = proc::run(c, 120).filter(proc::Out::ok).and_then(|o| Json::parse(&o.stdout).ok())?;
+    let mut v = vec![];
+    if let Some(Json::Obj(rt)) = j.get("devices") {
+        for (runtime, list) in rt {
+            for d in list.arr() {
+                let mut d = d.clone();
+                d.set("runtime", runtime.as_str());
+                v.push(d);
+            }
+        }
+    }
+    let _ =
+        state::write_atomic(&cache, obj! {"at" => state::wall_clock(), "devices" => v.clone()}.to_string().as_bytes());
+    Some(v)
+}
+
+/// Simulators. One whose runtime is gone is unusable and may go. A usable one may go when it
+/// is shut down, hasn't been used for 30 days (simctl's `lastUsedAt`, else when it was
+/// created) and isn't the newest of its device type. Its apps and test data are lost; undo
+/// makes a blank device with the same name, type and runtime.
 fn simulators(ctx: &Ctx, fresh: bool) -> Vec<Cand> {
-    let devices = ctx.home.join("Library/Developer/CoreSimulator/Devices");
-    if !is_dir(&devices) {
+    let dir = ctx.home.join("Library/Developer/CoreSimulator/Devices");
+    if !is_dir(&dir) {
         return vec![];
     }
-    let cache = ctx.file("cache-simctl.json");
-    let cached = state::read_json(&cache)
-        .filter(|j| !fresh && j.get("at").and_then(Json::u64).is_some_and(|t| t + 6 * 3600 > state::wall_clock()));
-    let udids: Vec<String> = match cached {
-        Some(j) => {
-            j.get("udids").map(Json::arr).unwrap_or(&[]).iter().filter_map(|u| u.str().map(String::from)).collect()
-        }
-        None => {
-            let mut c = Command::new("/usr/bin/xcrun");
-            c.args(["simctl", "list", "devices", "unavailable", "-j"]);
-            let Some(j) = proc::run(c, 60).filter(proc::Out::ok).and_then(|o| Json::parse(&o.stdout).ok()) else {
-                return vec![];
-            };
-            let mut v = vec![];
-            if let Some(Json::Obj(rt)) = j.get("devices") {
-                for (_, list) in rt {
-                    for d in list.arr() {
-                        if d.get("isAvailable") == Some(&Json::Bool(false)) && !d.s("udid").is_empty() {
-                            v.push(d.s("udid").to_string());
-                        }
-                    }
-                }
-            }
-            let _ = state::write_atomic(
-                &cache,
-                obj! {"at" => state::wall_clock(), "udids" => v.iter().map(Json::from).collect::<Vec<_>>()}
-                    .to_string()
-                    .as_bytes(),
-            );
-            v
-        }
+    let Some(devices) = sim_devices(ctx, fresh) else { return vec![] };
+    let created = |p: &Path| {
+        std::fs::metadata(p)
+            .and_then(|m| m.created())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_secs())
     };
-    udids
+    let ok_udid = |u: &str| u.len() == 36 && u.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
+    let devs: Vec<(Json, PathBuf, u64)> = devices
         .into_iter()
-        .filter(|u| u.len() == 36 && u.chars().all(|c| c.is_ascii_hexdigit() || c == '-'))
-        .map(|u| {
-            let mut c = leftover(
-                devices.join(&u),
-                "simulator",
-                "simulator whose runtime is no longer installed",
-                "unusable without its runtime",
-            );
-            c.how = How::Simctl(u);
-            c
+        .filter(|d| ok_udid(d.s("udid")))
+        .map(|d| {
+            let path = dir.join(d.s("udid"));
+            let used = iso_secs(d.s("lastUsedAt")).unwrap_or_else(|| created(&path));
+            (d, path, used)
         })
-        .filter(|c| is_dir(&c.path))
-        .collect()
+        .filter(|(_, p, _)| is_dir(p))
+        .collect();
+    let available = |d: &Json| d.get("isAvailable") != Some(&Json::Bool(false));
+    let newest = |kind: &str| {
+        devs.iter()
+            .filter(|(d, _, _)| available(d) && d.s("deviceTypeIdentifier") == kind)
+            .max_by_key(|(d, _, used)| (*used, d.s("udid").to_string()))
+            .map(|(d, _, _)| d.s("udid").to_string())
+    };
+    let loss = "its apps and test data are deleted; undo makes a blank device with the same name, type and runtime";
+    let mut out = vec![];
+    for (d, path, used) in &devs {
+        let (name, kind, runtime) = (d.s("name"), d.s("deviceTypeIdentifier"), d.s("runtime"));
+        let mut c = leftover(path.clone(), "simulator", "", "");
+        c.how = How::Simctl(d.s("udid").to_string());
+        c.active = Some(*used);
+        let days = ctx.now.saturating_sub(*used) / DAY;
+        if !available(d) {
+            c.why = format!("{name} simulator whose runtime is no longer installed");
+            c.plan = Some(Plan {
+                loss: "its apps and test data are deleted; it was unusable without its runtime".into(),
+                ..Plan::note("unusable without its runtime")
+            });
+            out.push(c);
+            continue;
+        }
+        if !sim_create_ok(name, kind, runtime) {
+            c.blocked = Some(format!("{name:?}: its name, type or runtime can't be passed to simctl safely to undo"));
+            out.push(c);
+            continue;
+        }
+        c.why = format!("{name} simulator, last used {days} days ago; {loss}");
+        c.plan = Some(Plan {
+            cwd: ctx.home.clone(),
+            steps: vec![["xcrun", "simctl", "create", name, kind, runtime].map(String::from).to_vec()],
+            new_device: true,
+            loss: loss.into(),
+            ..Plan::default()
+        });
+        c.blocked = if d.s("state") != "Shutdown" {
+            Some(format!("{name} simulator is {}", d.s("state").to_lowercase()))
+        } else if newest(kind).as_deref() == Some(d.s("udid")) {
+            Some(format!("the newest {name} simulator of its type is always kept"))
+        } else if *used + SIM_COLD_DAYS * DAY > ctx.now {
+            Some(format!("used {days} days ago (simulators: kept for {SIM_COLD_DAYS} days)"))
+        } else {
+            None
+        };
+        out.push(c);
+    }
+    out
 }
 
 // ---------------------------------------------------------------- AI coding tools
@@ -305,29 +404,48 @@ fn old_versions(dir: &Path, current: Option<&Path>, procs: &[String]) -> Vec<Pat
     all
 }
 
+/// Desktop apps whose Chromium caches (and only those) may go while the app isn't running:
+/// (folder in Application Support, process name).
+const ELECTRON_APPS: &[(&str, &str)] = &[("Claude", "Claude"), ("Codex", "Codex"), ("Cursor", "Cursor")];
+const ELECTRON_CACHES: &[&str] = &["Cache", "Code Cache", "GPUCache"];
+
 fn ai_leftovers(ctx: &Ctx, _fresh: bool) -> Vec<Cand> {
     let h = &ctx.home;
-    let procs = proc::processes();
+    // Without a process list every app counts as running: nothing in use is touched.
+    let listed = proc::processes();
+    let ps_failed = listed.is_none();
+    let procs = listed.unwrap_or_default();
     let support = h.join("Library/Application Support");
     let mut out = vec![];
+    let in_use = |c: &mut Cand, app: &str| {
+        if ps_failed {
+            c.blocked = Some("ps couldn't list running programs, so it may be in use".into());
+        } else if running(&procs, &[app]) {
+            c.blocked = Some(format!("{app} is running"));
+        }
+    };
     let current = std::fs::canonicalize(h.join(".local/bin/claude")).ok();
     for p in old_versions(&h.join(".local/share/claude/versions"), current.as_deref(), &procs) {
-        out.push(leftover(
+        let mut c = leftover(
             p,
             "claude_code_old",
-            "an old Claude Code version nothing runs",
+            "an old Claude Code version: not the one ~/.local/bin/claude runs, not the newest",
             "the updater downloads versions it needs",
-        ));
-    }
-    if !running(&procs, &["Claude"]) {
-        for p in old_versions(&support.join("Claude/claude-code"), None, &procs) {
-            out.push(leftover(
-                p,
-                "claude_code_old",
-                "an old Claude Code bundled by the desktop app",
-                "the app downloads versions it needs",
-            ));
+        );
+        if ps_failed {
+            c.blocked = Some("ps couldn't list running programs, so it may be in use".into());
         }
+        out.push(c);
+    }
+    for p in old_versions(&support.join("Claude/claude-code"), None, &procs) {
+        let mut c = leftover(
+            p,
+            "claude_code_old",
+            "an old Claude Code bundled by the desktop app",
+            "the app downloads versions it needs",
+        );
+        in_use(&mut c, "Claude");
+        out.push(c);
     }
     let hour_ago = state::wall_clock().saturating_sub(3600);
     for p in children(&h.join(".cache/codex-runtimes")) {
@@ -342,14 +460,21 @@ fn ai_leftovers(ctx: &Ctx, _fresh: bool) -> Vec<Cand> {
             ));
         }
     }
-    if !running(&procs, &["Cursor"]) {
-        let cur = support.join("Cursor");
-        let caches = ["Cache", "CachedData", "CachedExtensionVSIXs", "Code Cache", "GPUCache"].map(|d| cur.join(d));
-        let more =
-            ["Library/Caches/com.todesktop.230313mzl4w4u92", "Library/Caches/com.todesktop.230313mzl4w4u92.ShipIt"]
-                .map(|d| h.join(d));
-        for p in caches.into_iter().chain(more).filter(|p| is_dir(p)) {
-            out.push(leftover(p, "cursor_cache", "Cursor's cache (Cursor isn't running)", "Cursor refills it"));
+    // Only the Chromium caches: never Local Storage, IndexedDB, Preferences or config.
+    for (app, process) in ELECTRON_APPS {
+        for d in ELECTRON_CACHES {
+            let p = support.join(app).join(d);
+            if !is_dir(&p) {
+                continue;
+            }
+            let mut c = leftover(
+                p,
+                "electron_cache",
+                &format!("{app} desktop's {d} (Chromium cache)"),
+                &format!("{app} refills it on its next launch"),
+            );
+            in_use(&mut c, process);
+            out.push(c);
         }
     }
     for p in [".claude/projects", ".codex/sessions", ".codex/archived_sessions"]
@@ -556,23 +681,49 @@ fn rel_files(dir: &Path) -> Vec<String> {
     out
 }
 
+/// The last time anything under `dir` was written, or a file in it read. A folder's access
+/// time doesn't count (listing it, Headroom's own scan included, refreshes it), and links out
+/// of the folder aren't followed (a shared store isn't this folder).
 fn newest_use(dir: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
     let mut t = mtime(dir);
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         for p in children(&d) {
-            t = t.max(mtime(&p)).max(atime(&p));
-            if is_dir(&p) {
+            let Ok(m) = std::fs::symlink_metadata(&p) else { continue };
+            t = t.max(cold::mtime(&m));
+            if m.is_dir() {
                 stack.push(p);
+            } else if m.is_file() {
+                t = t.max(m.atime().max(0) as u64);
             }
         }
     }
     t
 }
 
+/// Downloads one cached snapshot again exactly (same revision, same files) and puts its refs
+/// back. Run by `rebuild`/`undo` with Headroom's own huggingface_hub (see `huggingface`).
+const HF_RESTORE: &str = "import json, os, sys
+from huggingface_hub import snapshot_download
+repo, kind, cache, rev, refs = sys.argv[1:6]
+snapshot_download(repo, repo_type=kind, revision=rev, cache_dir=cache, allow_patterns=sys.argv[6:] or None)
+folder = os.path.join(cache, kind + 's--' + repo.replace('/', '--'))
+for name, sha in json.loads(refs).items():
+    path = os.path.join(folder, 'refs', name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w') as f:
+        f.write(sha)
+";
+
+/// The Hugging Face cache: everything in it came from the Hub, so it can come back. The
+/// restore needs only `python3`: Headroom keeps its own huggingface_hub in
+/// HEADROOM_HOME/tools/hf (made on first restore), whatever the user's environments hold.
 fn huggingface(ctx: &Ctx, _fresh: bool) -> Vec<Cand> {
     let hub = ctx.home.join(".cache/huggingface/hub");
-    let tool = hf_tool(ctx);
+    let python = proc::which("python3", &ctx.path_var, None);
+    let venv = ctx.file("tools/hf").to_string_lossy().into_owned();
+    let vpy = format!("{venv}/bin/python");
     let mut out = vec![];
     for p in children(&hub) {
         let name = p.file_name().unwrap_or_default().to_string_lossy().into_owned();
@@ -587,25 +738,30 @@ fn huggingface(ctx: &Ctx, _fresh: bool) -> Vec<Cand> {
         let mut c = Cand::new(p.clone(), "hf_model", How::Tree);
         c.active = Some(newest_use(&p));
         c.why = format!("Hugging Face {kind} {repo}, downloaded from the Hub");
-        let mut steps = vec![];
+        let mut refs = vec![];
+        for r in rel_files(&p.join("refs")) {
+            let sha = std::fs::read_to_string(p.join("refs").join(&r)).unwrap_or_default().trim().to_string();
+            refs.push((r, sha));
+        }
+        let mut steps = vec![
+            vec!["python3".to_string(), "-m".into(), "venv".into(), venv.clone()],
+            vec![vpy.clone(), "-m".into(), "pip".into(), "install".into(), "-q".into(), "huggingface_hub".into()],
+        ];
         for snap in children(&p.join("snapshots")) {
             let rev = snap.file_name().unwrap_or_default().to_string_lossy().into_owned();
-            let mut s = vec![tool.clone().unwrap_or_default(), "download".into(), repo.clone()];
+            let mine =
+                Json::Obj(refs.iter().filter(|(_, s)| *s == rev).map(|(r, s)| (r.clone(), Json::from(s))).collect());
+            let mut s = vec![vpy.clone(), "-c".into(), HF_RESTORE.into(), repo.clone(), kind.into()];
+            s.extend([hub.to_string_lossy().into_owned(), rev, mine.to_string()]);
             s.extend(rel_files(&snap));
-            s.extend([
-                "--revision".into(),
-                rev,
-                "--repo-type".into(),
-                kind.into(),
-                "--cache-dir".into(),
-                hub.to_string_lossy().into_owned(),
-            ]);
             steps.push(s);
         }
-        c.blocked = match (&tool, steps.is_empty()) {
-            (None, _) => Some("no `hf` or `huggingface-cli` on PATH to download it again".into()),
-            (_, true) => Some("no snapshot in it to download again".into()),
-            _ => None,
+        c.blocked = if python.is_none() {
+            Some("no python3 on PATH to download it again".into())
+        } else if steps.len() == 2 {
+            Some("no snapshot in it to download again".into())
+        } else {
+            None
         };
         c.plan = Some(Plan { cwd: ctx.home.clone(), steps, ..Plan::default() });
         out.push(c);

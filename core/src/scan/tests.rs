@@ -435,3 +435,75 @@ fn only_a_shell_or_agent_parent_is_ignored() {
     assert!(!known_agent("node server.js"));
     assert!(!known_agent("/usr/bin/python3 judge/run.py"));
 }
+
+/// A shell that just sits in `dir` (bash waiting on a FIFO: no child processes).
+fn idle_shell(dir: &Path) -> std::process::Child {
+    let fifo = dir.join(".idle-fifo");
+    assert!(std::process::Command::new("/usr/bin/mkfifo").arg(&fifo).status().unwrap().success());
+    let c = std::process::Command::new("/bin/bash")
+        .args(["-c", "read -t 30 <> \"$0\"", &fifo.to_string_lossy()])
+        .current_dir(dir)
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    c
+}
+
+#[test]
+fn a_merged_worktree_made_today_from_old_commits_is_cold_unless_someone_sits_in_it() {
+    // Like the judge's world: `git worktree add` runs today (no date), the work is old.
+    let ctx = ctx("scan-wt-cold");
+    let w = world(&ctx);
+    let repo = w.join("agent");
+    write(&repo.join("README.md"), "# a\n");
+    write(&repo.join(".gitignore"), ".claude/worktrees/\n");
+    git(&repo, &["init", "-q", "-b", "main"], Some(OLD));
+    git(&repo, &["add", "-A"], Some(OLD));
+    git(&repo, &["commit", "-qm", "init"], Some(OLD));
+    let wt = repo.join(".claude/worktrees/merged");
+    git(&repo, &["worktree", "add", "-q", "-b", "agent/merged", &wt.to_string_lossy()], None);
+    write(&wt.join("f.js"), "feature");
+    git(&wt, &["add", "-A"], Some(OLD + 3600));
+    git(&wt, &["commit", "-qm", "feature"], Some(OLD + 3600));
+    git(&repo, &["merge", "-q", "--ff-only", "agent/merged"], None);
+    let s = scan(&ctx, &w).unwrap();
+    assert!(find(&s, &wt).reclaimable(), "{}", find(&s, &wt).reason());
+    // An agent's shell sitting in the worktree: it is in use.
+    let mut sh = idle_shell(&wt);
+    let s = scan(&ctx, &w).unwrap();
+    let _ = sh.kill();
+    let _ = sh.wait();
+    assert!(blocked(&s, &wt).contains("in use: bash"));
+    let _ = std::fs::remove_file(wt.join(".idle-fifo"));
+}
+
+#[test]
+fn a_shell_in_a_normal_project_does_not_hold_its_dependencies() {
+    let ctx = ctx("scan-shell-quiet");
+    let p = world(&ctx).join("app");
+    node_project(&p, OLD);
+    let mut sh = idle_shell(&p.join("node_modules"));
+    let s = scan(&ctx, &world(&ctx)).unwrap();
+    let _ = sh.kill();
+    let _ = sh.wait();
+    let c = find(&s, &p.join("node_modules"));
+    assert!(c.reclaimable(), "{}", c.reason());
+}
+
+#[test]
+fn a_branch_switch_in_a_worktree_today_is_use_even_at_the_same_commit() {
+    let ctx = ctx("scan-wt-checkout");
+    let w = world(&ctx);
+    let repo = w.join("agent");
+    write(&repo.join("README.md"), "# a\n");
+    write(&repo.join(".gitignore"), ".claude/worktrees/\n");
+    git(&repo, &["init", "-q", "-b", "main"], Some(OLD));
+    git(&repo, &["add", "-A"], Some(OLD));
+    git(&repo, &["commit", "-qm", "init"], Some(OLD));
+    let wt = repo.join(".claude/worktrees/merged");
+    git(&repo, &["worktree", "add", "-q", "-b", "agent/merged", &wt.to_string_lossy()], None);
+    // Today, at the same commit: someone started working here.
+    git(&wt, &["checkout", "-q", "-b", "fix"], None);
+    let s = scan(&ctx, &w).unwrap();
+    assert!(blocked(&s, &wt).contains("used 0 days ago"), "{}", find(&s, &wt).reason());
+}

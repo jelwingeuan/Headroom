@@ -22,6 +22,11 @@ pub struct Plan {
     pub pins: Option<String>,
     /// Why no command is needed, when `steps` is empty.
     pub note: String,
+    /// The rebuild makes a new thing in another place (a simulator gets a new UDID): undo
+    /// can't check the old path.
+    pub new_device: bool,
+    /// What is lost for good even after undo (a simulator's test data); shown in History.
+    pub loss: String,
 }
 
 impl Plan {
@@ -46,7 +51,7 @@ fn first_existing(dir: &Path, names: &[&str]) -> Option<PathBuf> {
     names.iter().map(|n| dir.join(n)).find(|p| p.is_file())
 }
 
-const NODE_LOCKS: &[&str] =
+pub const NODE_LOCKS: &[&str] =
     &["package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb"];
 const NODE_BUILDS: &[&str] =
     &[".next", ".nuxt", ".output", ".svelte-kit", ".angular", ".docusaurus", "dist", "build", "out"];
@@ -177,7 +182,7 @@ fn venv(c: &Cand) -> Result<Plan, String> {
             fallback,
             lock,
             pins: Some(p),
-            note: String::new(),
+            ..Plan::default()
         }),
         None if !fallback.is_empty() => Ok(Plan { cwd: base.clone(), steps: fallback, lock, ..Plan::default() }),
         None => Err("nothing records what was installed in it".into()),
@@ -247,7 +252,8 @@ pub fn restore(ctx: &Ctx, a: &Json) -> Outcome {
             Err(e) => Outcome::Failed(e),
         };
     }
-    if let Ok(m) = std::fs::symlink_metadata(&path) {
+    let new_device = a.get("new_device") == Some(&Json::Bool(true));
+    if let Some(m) = std::fs::symlink_metadata(&path).ok().filter(|_| !new_device) {
         // What a failed delete of ours left behind is ours to rebuild over; anything else
         // at the path is left alone.
         use std::os::unix::fs::MetadataExt;
@@ -262,6 +268,14 @@ pub fn restore(ctx: &Ctx, a: &Json) -> Outcome {
     if steps.is_empty() {
         let why = a.s("note");
         return Outcome::NotRestorable(if why.is_empty() { "nothing to run".into() } else { why.into() });
+    }
+    if new_device
+        && !steps.iter().all(|s| {
+            matches!(s.iter().map(String::as_str).collect::<Vec<_>>()[..], ["xcrun", "simctl", "create", n, k, r]
+                if crate::machine::sim_create_ok(n, k, r))
+        })
+    {
+        return Outcome::Failed("refused: the recorded simctl command isn't a plain create".into());
     }
     let cwd = PathBuf::from(a.s("cwd"));
     let pins = a.s("pins");
@@ -280,7 +294,7 @@ pub fn restore(ctx: &Ctx, a: &Json) -> Outcome {
     }
     match result {
         Err(e) => Outcome::Failed(e),
-        Ok(()) if path.is_absolute() && std::fs::symlink_metadata(&path).is_err() => {
+        Ok(()) if !new_device && path.is_absolute() && std::fs::symlink_metadata(&path).is_err() => {
             Outcome::Failed(format!("the commands ran but {} is still missing", path.display()))
         }
         Ok(()) => Outcome::Restored(t.elapsed().as_secs()),
