@@ -328,15 +328,18 @@ fn cold_simulators_go_but_never_booted_recent_or_the_newest_of_their_type() {
             format!("xcrun simctl create cold-{n} com.apple.CoreSimulator.SimDeviceType.iPhone-16 com.apple.CoreSimulator.SimRuntime.iOS-18-2")
         );
     }
-    assert!(by(3).blocked.as_deref().unwrap().contains("newest"), "{:?}", by(3).blocked);
+    // The one device really used is the newest of its type, however old the use; a device made
+    // today but never used doesn't outrank it (it's kept anyway: younger than 30 days).
+    assert!(by(5).blocked.as_deref().unwrap().contains("newest"), "{:?}", by(5).blocked);
+    assert!(!by(3).reclaimable() && !by(3).blocked.as_deref().unwrap().contains("newest"), "{:?}", by(3).blocked);
     assert!(by(4).blocked.as_deref().unwrap().contains("booted"), "{:?}", by(4).blocked);
-    assert!(by(5).reclaimable(), "an old lastUsedAt counts: {}", by(5).reason());
     assert!(by(6).reclaimable(), "{}", by(6).reason());
     // Used ten days ago: kept for 30 days.
     let mut recent = devices_with_use(&ctx, &u(2), 10);
     judge(&ctx, &mut recent, Some(&[]));
     let x = recent.iter().find(|x| x.path == dir.join(u(2))).unwrap();
-    assert!(x.blocked.as_deref().unwrap().contains("used 10 days ago"), "{:?}", x.blocked);
+    // Now also the most recently used of its type, which wins the reason; either way it's kept.
+    assert!(!x.reclaimable(), "{:?}", x.blocked);
 }
 
 /// The cached device list with one device's lastUsedAt set `days` ago.

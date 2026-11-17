@@ -338,7 +338,8 @@ fn simulators(ctx: &Ctx, fresh: bool) -> Vec<Cand> {
     let newest = |kind: &str| {
         devs.iter()
             .filter(|(d, _, _)| available(d) && d.s("deviceTypeIdentifier") == kind)
-            .max_by_key(|(d, _, used)| (*used, d.s("udid").to_string()))
+            // A device that was really used beats one that never was; creation time only ranks never-used ones.
+            .max_by_key(|(d, _, used)| (!d.s("lastUsedAt").is_empty(), *used, d.s("udid").to_string()))
             .map(|(d, _, _)| d.s("udid").to_string())
     };
     let loss = "its apps and test data are deleted; undo makes a blank device with the same name, type and runtime";
