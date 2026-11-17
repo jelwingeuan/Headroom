@@ -626,10 +626,13 @@ class Census:
                 except OSError:
                     born = 0.0
                 known[folder] = (rt, dev, iso_time(dev.get('lastUsedAt')) or born)
-        newest = {}  # deviceTypeIdentifier -> the folder of its most recently used device
+        # deviceTypeIdentifier -> the folder of its most recently used device. A device that was
+        # really used beats one that never was; creation time only decides among never-used ones.
+        rank = lambda f: (bool(known[f][1].get('lastUsedAt')), known[f][2])
+        newest = {}
         for folder, (_, dev, used) in known.items():
             t = dev.get('deviceTypeIdentifier')
-            if t not in newest or used > known[newest[t]][2]:
+            if t not in newest or rank(folder) > rank(newest[t]):
                 newest[t] = folder
         for folder in folders:
             if folder not in known:

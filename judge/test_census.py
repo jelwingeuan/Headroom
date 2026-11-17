@@ -295,6 +295,26 @@ class HelperTest(unittest.TestCase):
         self.assertEqual(data['items'], [])
         self.assertEqual(set(data) >= {'items', 'skipped', 'totals', 'elapsed_secs'}, True)
 
+    def test_never_used_simulator_does_not_outrank_a_used_one(self):
+        tmp = os.path.realpath(tempfile.mkdtemp(prefix='census-sim-'))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        devdir = os.path.join(tmp, 'Library/Developer/CoreSimulator/Devices')
+        for u in ('OLD-USED', 'NEW-NEVER'):
+            os.makedirs(os.path.join(devdir, u))
+        now = time.time()
+        used = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(now - 60 * 86400))
+        devs = {'devices': {'com.apple.CoreSimulator.SimRuntime.iOS-27-0': [
+            {'udid': 'OLD-USED', 'name': 'iPad Pro', 'state': 'Shutdown', 'lastUsedAt': used,
+             'deviceTypeIdentifier': 'ipad-pro'},
+            {'udid': 'NEW-NEVER', 'name': 'iPad Pro', 'state': 'Shutdown', 'deviceTypeIdentifier': 'ipad-pro'}]}}
+        real = census.run
+        census.run = lambda cmd, **k: (0, json.dumps(devs)) if cmd[1:3] == ['simctl', 'list'] else real(cmd, **k)
+        self.addCleanup(setattr, census, 'run', real)
+        c = census.Census(tmp, 14, procs=[], now=now)
+        c.simulators()
+        status = {os.path.basename(i['path']): i['status'] for i in c.items}
+        self.assertEqual(status['OLD-USED'], 'protected')  # the device actually used is kept
+
 
 if __name__ == '__main__':
     unittest.main()
