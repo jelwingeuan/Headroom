@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/icon.svg" width="128" height="128" alt="Headroom logo: a block with its top kept clear"></p>
+
 # Headroom
 
 Your Mac never drops below the free space you chose, and you never lose work getting there.
