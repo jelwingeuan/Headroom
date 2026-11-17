@@ -6,6 +6,7 @@ import contextlib
 import io
 import json
 import os
+import plistlib
 import shutil
 import struct
 import subprocess
@@ -140,10 +141,62 @@ class EligibleTest(Tmp):
                  'keep_files': [self.p('w/edited/node_modules/k.js')], 'recent_paths': [self.p('w/recent')],
                  'projects': [{'protected': [{'path': self.p('w/live/node_modules'), 'why': 'busy'}]}]}
         self.assertEqual([e['path'] for e in run.eligible(truth)], [self.p('w/a/node_modules'), self.p('w/a/target-link')])
-        nums = run.eligible_numbers(truth)
+        nums = run.eligible_numbers(run.sized_eligible(truth))
         self.assertEqual(nums['eligible_items'], 2)
         self.assertEqual(nums['eligible_bytes'], world.alloc_bytes(self.p('w/a/node_modules')))
         self.assertGreaterEqual(nums['eligible_bytes'], 50000)
+
+
+class GapTest(Tmp):
+    def test_buckets(self):
+        sized = [{'path': '/w/a/node_modules', 'kind': 'node_modules', 'bytes': 1000},
+                 {'path': '/w/b/target', 'kind': 'target', 'bytes': 500},
+                 {'path': '/w/r/.claude/worktrees/merged', 'kind': 'merged worktree', 'bytes': 30},
+                 {'path': '/w/r/.git/worktrees/merged', 'kind': 'merged worktree', 'bytes': 10},
+                 {'path': '/hf/models--x', 'kind': 'HF snapshot', 'bytes': 7}]
+        gone = {'/w/a/node_modules', '/w/b/target'}
+        protected = {'hand-edited file inside': {'items': 1, 'bytes': 4}, 'busy': {'items': 2, 'bytes': 6}}
+        history = [{'path': 'docker://build-cache', 'kind': 'docker_build_cache', 'bytes': 1500, 'frees_host': False},
+                   {'path': '/w/a/node_modules', 'kind': 'node_modules', 'bytes': 990, 'frees_host': True},
+                   {'path': '/w/a/node_modules/.cache', 'kind': 'cache', 'bytes': 3},
+                   {'path': '/Users/r/.npm/_cacache', 'kind': 'npm_cache', 'bytes': 200, 'frees_host': True},
+                   {'path': '/w', 'kind': 'whole world', 'bytes': 1}]  # contains tracked paths: not "other"
+        tracked = [x['path'] for x in sized] + ['/w/live/node_modules']
+        g = run.gap(sized, gone, protected, history, tracked)
+        self.assertEqual(g['eligible_freed'], {'bytes': 1500, 'items': 2})
+        kept = g['eligible_kept']
+        self.assertEqual((kept['bytes'], kept['items'], kept['kinds']), (47, 3, {'merged worktree': 2, 'HF snapshot': 1}))
+        self.assertEqual([x['path'] for x in kept['paths']], [x['path'] for x in sized[2:]])
+        self.assertEqual((g['protected']['bytes'], g['protected']['items']), (10, 3))
+        self.assertEqual((g['not_counted']['bytes'], g['not_counted']['items']), (1500, 1))
+        self.assertEqual((g['other_freed']['bytes'], g['other_freed']['paths']), (200, ['/Users/r/.npm/_cacache']))
+        md = '\n'.join(run.gap_markdown(g))
+        self.assertIn('| eligible, freed | 0.000 GB | 2 |  |', md)
+        self.assertIn('merged worktree x2', md)
+        self.assertIn('hand-edited file inside 0.000 GB (1)', md)
+        self.assertIn('- `/hf/models--x` (HF snapshot, 0.000 GB)', md)
+
+    def test_protected_bytes_and_restore(self):
+        edited = os.path.dirname(put(self.p('w/e/node_modules/k.js'), 'k' * 5000))
+        busy = os.path.dirname(put(self.p('w/live/node_modules/x.js'), 'x' * 9000))
+        newest = os.path.dirname(put(self.p('sims/NEW/device.plist'), 'p'))
+        truth = {'rebuildable': [{'path': edited, 'eligible': False, 'why': 'hand-edited file inside'},
+                                 {'path': self.p('w/gone'), 'eligible': True}],
+                 'keep_files': [], 'recent_paths': [],
+                 'projects': [{'protected': [{'path': busy, 'why': 'busy'}]}],
+                 'protected': [{'path': newest, 'why': 'newest simulator of its type'}]}
+        got = run.protected_bytes(truth)
+        self.assertEqual(sorted(got), ['busy', 'hand-edited file inside', 'newest simulator of its type'])
+        self.assertEqual(got['busy'], {'items': 1, 'bytes': world.alloc_bytes(busy)})
+        sim = {'path': self.p('sims/OLD'), 'restore': 'simulator',
+               'sim': {'name': 'judge-cold-1', 'type': 'T', 'runtime': 'R'}}
+        devices = {'R': [{'name': 'judge-cold-1', 'deviceTypeIdentifier': 'T', 'udid': 'NEW-UDID'}]}
+        self.assertTrue(run.restored(sim, devices))  # a new blank device of the same name and type counts
+        self.assertFalse(run.restored(sim, {'R': [{'name': 'judge-cold-1', 'deviceTypeIdentifier': 'other'}]}))
+        self.assertFalse(run.restored(sim, {}))
+        self.assertTrue(run.restored({'path': self.p('nope'), 'restore': 'none'}, {}))
+        self.assertFalse(run.restored({'path': self.p('nope')}, {}))
+        self.assertTrue(run.restored({'path': busy}, {}))
 
 
 class SandboxTest(Tmp):
@@ -195,7 +248,7 @@ class DockerTest(Tmp):
 class WorldTest(Tmp):
     def test_scale(self):
         self.assertEqual(world.counts(1.0), world.FULL)
-        self.assertEqual(set(world.counts(0.0).values()), {1})
+        self.assertEqual(world.counts(0.0), dict({k: 1 for k in world.FULL}, dupe=5))  # >= 5 copies to dedupe
         self.assertEqual(world.counts(0.5)['node'], 5)
         self.assertEqual(world.fit_ratio(1000 * GB), 1.0)
         self.assertEqual(world.fit_ratio(2 * GB), 0.0)
@@ -203,7 +256,7 @@ class WorldTest(Tmp):
 
     def test_plan_spreads_activity_over_kinds(self):
         order = world.plan(world.FULL)
-        self.assertEqual(len(order), sum(world.FULL.values()))
+        self.assertEqual(len(order), sum(n for k, n in world.FULL.items() if k not in ('dupe', 'rustbig')))
         self.assertEqual(len({k for k, _ in order[:5]}), 5)
         by_kind = {}
         for i, (kind, _) in enumerate(order):
@@ -328,6 +381,145 @@ class WorldTest(Tmp):
         self.assertFalse(os.path.exists(self.p('world')))
 
 
+class StockTest(Tmp):
+    """The seeding fixtures, run against temp folders and a fake xcrun (never the real ones)."""
+
+    def setUp(self):
+        super().setUp()
+        for name, value in [('SIM_DEVICES', self.p('Devices')), ('CLAUDE_VERSIONS', self.p('versions')),
+                            ('CLAUDE_BIN', self.p('bin/claude')), ('CLAUDE_DESKTOP', self.p('Claude')),
+                            ('stock_size', lambda kind, ratio: world.MB)]:
+            self.addCleanup(setattr, world, name, getattr(world, name))
+            setattr(world, name, value)
+        self.truth = {'created': 1_700_000_000, 'rebuildable': [], 'backdate': [], 'manifest_roots': [], 'protected': [],
+                      'stock': {}, 'projects': [], 'recent_paths': [], 'keep_files': []}
+
+    def test_derived_data_matcher(self):
+        derived, project = self.p('DerivedData'), self.p('world/swift-03')
+
+        def folder(name, workspace=None, raw=None):
+            os.makedirs(os.path.join(derived, name))
+            if workspace is not None or raw is not None:
+                with open(os.path.join(derived, name, 'info.plist'), 'wb') as f:
+                    f.write(raw if raw is not None else plistlib.dumps({'WorkspacePath': workspace}))
+        h = 'cjhpbrcfxcngsoeocscpllyvgxgy'
+        folder(f'swift-03-{h}', project)  # named after the folder, as Xcode does for a package
+        folder(f'SwiftCharlie-{h}', os.path.join(project, '.swiftpm/xcode/package.xcworkspace'))  # or the package
+        folder(f'swift-03-{"z" * 28}', self.p('world/elsewhere'))  # right name, other workspace
+        folder(f'swift-030-{h}', self.p('world/swift-030'))  # a sibling whose name starts the same
+        folder(f'swift-03-{"a" * 28}')  # no info.plist
+        folder(f'swift-03-{"b" * 28}', raw=b'not a plist')
+        folder('swift-03-short', project)
+        folder('ModuleCache.noindex')
+        self.assertEqual(world.derived_data_of(project, 'SwiftCharlie', derived),
+                         [os.path.join(derived, f'SwiftCharlie-{h}'), os.path.join(derived, f'swift-03-{h}')])
+        self.assertEqual(world.derived_data_of(project, '', self.p('missing')), [])
+
+    def test_ollama_manifest_found_wherever_ollama_put_it(self):
+        models = self.p('models')
+        manifest = {'config': {'digest': 'sha256:c0'}, 'layers': [{'digest': 'sha256:w1'}, {'digest': 'sha256:p2'}]}
+        put(os.path.join(models, 'manifests/registry.ollama.ai/library/all-minilm/latest'), json.dumps(manifest))
+        put(os.path.join(models, 'manifests/localhost/judge/judge-custom/latest'), json.dumps(manifest))
+        self.assertEqual(world.ollama_files('all-minilm', models),
+                         [os.path.join(models, 'manifests/registry.ollama.ai/library/all-minilm/latest')]
+                         + [os.path.join(models, 'blobs', b) for b in ('sha256-c0', 'sha256-w1', 'sha256-p2')])
+        self.assertTrue(world.ollama_manifest('judge-custom', models).endswith('localhost/judge/judge-custom/latest'))
+        with self.assertRaisesRegex(RuntimeError, 'no manifest for gone.*all-minilm/latest'):
+            world.ollama_manifest('gone', models)
+
+    def test_pick_ios_runtime(self):
+        def rt(ident, version, types, platform='iOS', ok=True):
+            return {'identifier': ident, 'version': version, 'platform': platform, 'isAvailable': ok,
+                    'supportedDeviceTypes': [{'identifier': i, 'productFamily': f} for i, f in types]}
+        phones = [('iPhone-16', 'iPhone'), ('iPhone-16-Pro', 'iPhone'), ('iPad-Air', 'iPad')]
+        runtimes = [rt('watchOS-11', '11.2', [('Watch', 'Apple Watch')], 'watchOS'),
+                    rt('iOS-18-2', '18.2', phones), rt('iOS-18-2-special', '18.2', [('iPhone-Duo', 'iPhone')]),
+                    rt('iOS-17-5', '17.5', phones), rt('iOS-19-0', '19.0', phones, ok=False)]
+        self.assertEqual(world.pick_ios_runtime(runtimes), ('iOS-18-2', 'iPhone-16'))
+        self.assertIsNone(world.pick_ios_runtime(runtimes[:1]))
+
+    def fake_xcrun(self, runtimes):
+        bindir = self.p('fakebin')
+        put(os.path.join(bindir, 'xcrun'), (
+            f'#!{sys.executable} -I\nimport json, os, sys, uuid\na = sys.argv[1:]\n'
+            f'if a[:3] == ["simctl", "list", "runtimes"]:\n    print(json.dumps({{"runtimes": {runtimes!r}}}))\n'
+            f'elif a[:2] == ["simctl", "create"]:\n    u = str(uuid.uuid4()).upper()\n'
+            f'    d = os.path.join({self.p("Devices")!r}, u)\n    os.makedirs(d)\n'
+            f'    open(os.path.join(d, "device.plist"), "w").write("x")\n    print(u)\n'
+            f'else:\n    sys.exit(2)\n'))
+        os.chmod(os.path.join(bindir, 'xcrun'), 0o755)
+        old = os.environ['PATH']
+        self.addCleanup(os.environ.__setitem__, 'PATH', old)
+        os.environ['PATH'] = bindir + os.pathsep + old
+
+    def test_simulators(self):
+        types = [{'identifier': 'iPhone-16', 'productFamily': 'iPhone'}]
+        self.fake_xcrun([{'identifier': 'iOS-18-2', 'version': '18.2', 'platform': 'iOS', 'isAvailable': True,
+                          'supportedDeviceTypes': types}])
+        world.simulators(self.truth, 0.5)
+        cold = [e for e in self.truth['rebuildable'] if e['kind'] == 'simulator']
+        self.assertEqual([e['sim']['name'] for e in cold], ['judge-cold-1', 'judge-cold-2'])
+        self.assertTrue(all(e['restore'] == 'simulator' and e['eligible'] and e['sim']['runtime'] == 'iOS-18-2'
+                            for e in cold))
+        self.assertEqual([b[1] for b in self.truth['backdate']], [1_700_000_000 - 75 * DAY, 1_700_000_000 - 140 * DAY])
+        newest = self.truth['protected'][0]
+        self.assertEqual(newest['why'], 'newest simulator of its type')
+        self.assertEqual(self.truth['manifest_roots'], [os.path.join(newest['path'], world.SIM_PAYLOAD)])
+        self.assertEqual(os.path.getsize(os.path.join(cold[0]['path'], world.SIM_PAYLOAD)), world.MB)
+        self.assertEqual([e['path'] for e in run.eligible(self.truth)], [e['path'] for e in cold])
+        self.assertEqual(self.truth['stock']['simulators'], {'runtime': 'iOS-18-2', 'type': 'iPhone-16'})
+
+    def test_no_ios_runtime_is_not_measured(self):
+        self.fake_xcrun([])
+        world.simulators(self.truth, 0.5)
+        self.assertEqual(self.truth['stock']['simulators'], 'not measured: no iOS simulator runtime on this runner')
+        self.assertEqual((self.truth['rebuildable'], os.path.exists(self.p('Devices'))), ([], False))
+        self.assertEqual(run.not_measured(self.truth),
+                         {'not_measured': ['simulators: not measured: no iOS simulator runtime on this runner']})
+
+    def test_claude_cli_versions(self):
+        world.claude_cli(self.truth, 0.5)
+        old = [e for e in self.truth['rebuildable'] if e['kind'] == 'Claude Code version']
+        self.assertEqual([os.path.basename(e['path']) for e in old], ['1.0.100', '1.0.110', '1.0.120'])
+        self.assertTrue(all(e['restore'] == 'none' and e['eligible'] for e in old))
+        current = os.path.join(self.p('versions'), '1.0.130')
+        self.assertEqual(os.readlink(self.p('bin/claude')), current)
+        with open(current, 'rb') as f:
+            self.assertEqual(f.read(4), world.MACHO)
+        self.assertEqual(self.truth['manifest_roots'], [current, self.p('bin/claude')])
+        self.assertEqual(len(run.eligible(self.truth)), 3)
+        self.truth['stock'] = {}
+        world.claude_cli(self.truth, 0.5)  # never on top of a real install
+        self.assertTrue(self.truth['stock']['claude_cli'].startswith('not measured'))
+
+    def test_electron_cache(self):
+        running = subprocess.run(['pgrep', '-x', 'Claude'], capture_output=True).returncode == 0
+        world.electron_cache(self.truth, 0.5)
+        caches = [e for e in self.truth['rebuildable'] if e['kind'] == 'Electron cache']
+        self.assertEqual([os.path.basename(e['path']) for e in caches], [] if running else ['Cache', 'Code Cache'])
+        self.assertTrue(all(e['eligible'] and e['restore'] == 'none' for e in caches))
+        self.assertTrue(os.path.exists(self.p('Claude/Cache/Cache_Data/f_000001')))
+        self.assertTrue(os.path.exists(self.p('Claude/Code Cache/js/0000000000000001_0')))
+        self.assertEqual(self.truth['manifest_roots'], [self.p('Claude')])
+        kept = manifest.snapshot(*manifest.scope(self.truth))
+        self.assertIn(self.p('Claude/Local Storage/leveldb/000003.log'), kept)
+        hashed = [k for k in kept if '/Cache/' in k or '/Code Cache/' in k]
+        self.assertEqual(bool(hashed), running)  # caches are hashed only while the app runs
+        self.assertEqual(len(run.eligible(self.truth)), 0 if running else 2)
+
+    def test_electron_cache_is_protected_while_the_app_runs(self):
+        bindir = self.p('fakebin')
+        put(os.path.join(bindir, 'pgrep'), '#!/bin/sh\nexit 0\n')  # "Claude is running"
+        os.chmod(os.path.join(bindir, 'pgrep'), 0o755)
+        old = os.environ['PATH']
+        self.addCleanup(os.environ.__setitem__, 'PATH', old)
+        os.environ['PATH'] = bindir + os.pathsep + old
+        world.electron_cache(self.truth, 0.5)
+        self.assertEqual([e for e in self.truth['rebuildable'] if e['kind'] == 'Electron cache'], [])
+        self.assertEqual([x['why'] for x in self.truth['protected']][:2], ['Claude is running'] * 2)
+        self.assertIn('Claude is running', run.protected_bytes(self.truth))
+
+
 class TreeTest(Tmp):
     def test_make_tree_and_signature(self):
         top = self.p('tree')
@@ -348,6 +540,8 @@ case "$1" in
     echo "$2" > "$HEADROOM_HOME/root"
     rm -rf "$2/app/node_modules" @EXTRA@
     docker system df --format json > /dev/null
+    echo '{"path": "docker://build-cache", "kind": "docker_build_cache", "bytes": 1500000000, "frees_host": false}' \
+      >> "$HEADROOM_HOME/history.jsonl"
     echo '{"freed_bytes": 0, "actions": []}' ;;
   rebuild|undo)
     r=$(cat "$HEADROOM_HOME/root")
@@ -409,6 +603,12 @@ class EndToEndTest(Tmp):
         self.assertGreater(reclaim['numbers']['eligible_bytes'], 0)
         self.assertIsInstance(reclaim['numbers']['freed_share'], float)
         self.assertEqual(got['1 Safety']['numbers']['rebuildable_deleted'], 1)
+        g = reclaim['gap']
+        self.assertEqual((g['eligible_freed']['items'], g['eligible_kept']['items']), (1, 0))
+        self.assertEqual(g['eligible_freed']['bytes'], reclaim['numbers']['eligible_bytes'])
+        self.assertEqual((g['not_counted']['bytes'], g['not_counted']['kinds']), (1500000000, {'docker_build_cache': 1}))
+        with open(os.path.join(out, 'report.json')) as f:
+            self.assertIn('"gap"', f.read())
         self.assertEqual(got['Docker (shim)']['numbers']['calls'], 1)
         self.assertEqual(got['Models']['status'], run.NOT)
         self.assertIn(got['5 No network']['status'], (run.PASS, run.NOT))

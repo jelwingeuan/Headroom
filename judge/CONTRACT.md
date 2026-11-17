@@ -79,7 +79,11 @@ Runs the background agent, without UI, until SIGTERM. It must stay alive.
    allocated size (hard links once), measured right before `clean`, of everything listed
    below as "may be deleted" that is not protected, recently opened or busy. After the
    rebuild the judge runs each touched project's own build or check command (`npm ls`,
-   `next build`, `cargo build`, `xcodebuild`, ...); all must exit 0.
+   `next build`, `cargo build`, `xcodebuild`, ...); all must exit 0. The summary adds a gap
+   table (eligible freed, eligible kept, protected, freed but not counted) built from
+   `truth.json` and `HEADROOM_HOME/history.jsonl`: one JSON object per line with at least
+   `path`, `kind`, `bytes` and `frees_host` (false when deleting it frees nothing on this
+   volume, such as Docker's VM disk). It explains the score and never changes it.
 2. Autopilot: 30 calls of `autopilot --once`, `--now` advancing by 86400 each call,
    `--recent-days 14`. Before each call the judge writes one growth file (user data, not
    reclaimable). The budget leaves the first 8 ticks without pressure. Then `undo --all`.
@@ -102,13 +106,25 @@ file fails the gate.
 - Agent worktrees with unpushed commits or with ignored files such as `.env`.
 - `~/.claude/projects` and `~/.codex/sessions`.
 - An `ollama create` model and every blob it uses, shared ones included.
+- The newest iOS simulator of each device type (the judge hashes its test data).
+- The current Claude Code version (the one `~/.local/bin/claude` points at) and the launcher.
+- An Electron app's caches while that app is running, and its data (config, `Preferences`,
+  `Local Storage`, `IndexedDB`) always.
 - VS Code's `storage.json` and Docker Desktop's folder (its VM disk).
 - The bare repos in `~/judge-remotes` and the judge's growth files.
 
-May be deleted, and must come back on `rebuild --all` / `undo --all`: `node_modules`,
-`.next`, Rust `target`, a `.venv` with a manifest, Xcode DerivedData, a merged and clean agent
-worktree (with its `.git/worktrees/<name>`), a pulled Ollama model's own files, the Hugging
-Face cache snapshot.
+May be deleted, and must come back on `rebuild --all` / `undo --all`: `node_modules` (also
+several copies of one project that share a lockfile), `.next`, Rust `target`, a `.venv` with a
+manifest, Xcode DerivedData, a merged and clean agent worktree (with its
+`.git/worktrees/<name>`), a pulled Ollama model's own files, the Hugging Face cache snapshot.
+
+May be deleted, and come back as a new blank device with the same name, device type and
+runtime: an iOS simulator not booted for 30 days or more that is not the newest of its device
+type (its test data is lost; History says so).
+
+May be deleted, and need not come back: old Claude Code versions in
+`~/.local/share/claude/versions` (not the current one), and the Chromium caches (`Cache`,
+`Code Cache`) of Claude desktop while Claude is not running; the app refills them.
 
 Docker: read-only commands plus `image rm`, `rmi`, `image prune` and `builder prune` only.
 Any other docker command, `volume rm`, `volume prune` and `system prune` included, fails.
@@ -124,7 +140,19 @@ Any other docker command, `volume rm`, `volume prune` and `system prune` include
   `--now` minus one hour before each tick.
 - The busy project runs `node server.js` with its cwd in the project.
 - Agent worktrees live in `<repo>/.claude/worktrees/`; the remote is a local bare repo.
-- Ollama models in `~/.ollama/models`, Hugging Face cache in `~/.cache/huggingface/hub`.
+- Ollama models in `~/.ollama/models`: two pulled registry models and one `ollama create`
+  model built on the first. Hugging Face cache in `~/.cache/huggingface/hub`.
+- iOS simulators made with `xcrun simctl create` on the newest iOS runtime the runner has,
+  never booted: two cold ones (folder mtimes 75 and 140 days old, each holding test data under
+  `data/Containers/Data/Application/`) and the newest device of the same type. No iOS runtime
+  on the runner: no simulators, reported as not measured.
+- Claude Code: `~/.local/share/claude/versions/<version>` executables, three old ones and the
+  current one, with `~/.local/bin/claude` a symlink to the current one.
+- Claude desktop: `~/Library/Application Support/Claude` with `Cache/Cache_Data` and
+  `Code Cache/js` filled, plus app data. Claude is not running on the runner.
+- Five or more copies of one Node project with the same `package.json` and
+  `package-lock.json`, so their `node_modules` are identical (a dedupe target).
+- All of the stock above is sized from the runner's free space, planned to leave 15 GB free.
 - No Docker daemon. The shim answers `images`, `image ls`, `system df`, `builder du`,
   `volume ls`, `ps`, `version` and `info` (JSON Lines with `--format json`); every other
   command prints nothing and exits 0.
