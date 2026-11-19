@@ -17,6 +17,7 @@ struct MainView: View {
             }
         }
         .frame(minWidth: 620, minHeight: 400)
+        .tint(.headroom)
         .onAppear {
             model.loadHistory()
             model.loadSettings()
@@ -49,9 +50,9 @@ struct HistoryView: View {
                             ActionRow(action: action) { trailing(action) }
                         }
                     } header: {
-                        let freed = done.filter { !$0.undone }.reduce(0) { $0 + $1.bytes }
-                        Text("Headroom freed \(bytes(freed)) from \(done.filter { !$0.undone }.count) folders")
-                            .monospacedDigit()
+                        let kept = done.filter { !$0.undone }, rebuilt = done.count - kept.count
+                        PaneSummary("Freed \(bytes(kept.reduce(0) { $0 + $1.bytes })) from \(kept.count) \(kept.count == 1 ? "folder" : "folders")"
+                            + (rebuilt > 0 ? " · \(rebuilt) rebuilt" : ""))
                     }
                 }
                 .animation(reduceMotion ? .easeInOut(duration: 0.2) : .spring(response: 0.35, dampingFraction: 1),
@@ -100,19 +101,22 @@ struct WouldHaveDoneView: View {
             if planned.isEmpty {
                 EmptyState(symbol: "eye", title: "Nothing to show yet",
                            detail: noBudget
-                               ? "Choose how much space to keep free first. For its first 7 days Headroom then only shows what it would delete, here."
-                               : "For its first 7 days Headroom only shows what it would delete. Its picks appear here.",
+                               ? "Choose how much space to keep free. For the first 7 days after that, Headroom only lists here what it would delete."
+                               : "For its first 7 days, Headroom only lists here what it would delete.",
                            action: noBudget ? ("Set a Budget…", openSettings) : nil)
             } else {
                 List {
                     Section {
                         ForEach(planned) { ActionRow(action: $0) { EmptyView() } }
                     } header: {
-                        Text("Would have freed \(bytes(planned.reduce(0) { $0 + $1.bytes })). Nothing was deleted.")
-                            .monospacedDigit()
-                    } footer: {
-                        if !model.status.dryRun {
-                            Footnote("The dry run is over. Headroom now frees space for real, and everything it deletes appears in History.")
+                        let total = bytes(planned.reduce(0) { $0 + $1.bytes })
+                        VStack(alignment: .leading, spacing: 4) {
+                            PaneSummary(model.status.dryRun
+                                ? "The dry run would free \(total). Nothing has been deleted."
+                                : "The dry run picked these \(total). It has ended.")
+                            if !model.status.dryRun {
+                                Footnote("Headroom now frees space for real. What it deletes appears in History.")
+                            }
                         }
                     }
                 }
@@ -198,7 +202,7 @@ struct SettingsView: View {
                 } footer: {
                     Footnote(binding.wrappedValue.budgetBytes == 0
                         ? "Headroom won't delete anything until you choose an amount."
-                        : "When free space drops below this, Headroom deletes the files you haven't used for longest, as long as it can rebuild them.")
+                        : "When free space drops below this amount, Headroom deletes the files you haven't used for longest, as long as it can rebuild them. It never touches a project you opened within the days above.")
                 }
                 Section {
                     Toggle("Only show what Headroom would delete", isOn: binding.dryRun)
@@ -221,14 +225,18 @@ struct SettingsView: View {
                         Button("Open Login Items…") { SMAppService.openSystemSettingsLoginItems() }
                     }
                 }
-                LabeledContent("Full Disk Access") {
+                LabeledContent {
                     Button(model.status.needsFullDiskAccess ? "Allow…" : "Review…") { openFullDiskAccessSettings() }
+                } label: {
+                    Text("Full Disk Access")
+                    Text(model.status.needsFullDiskAccess ? "Off: some folders can't be measured" : "No folders blocked")
                 }
             } header: {
                 Text("General")
             }
         }
         .formStyle(.grouped)
+        .tint(.headroom)
         .frame(width: 460)
         .fixedSize(horizontal: false, vertical: true)
         .onAppear {
@@ -249,5 +257,16 @@ struct Footnote: View {
         Text(text).font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.leading)
             .fixedSize(horizontal: false, vertical: true)
             .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// A pane's one-line summary: body text, primary color, so it reads as content, not chrome.
+struct PaneSummary: View {
+    let text: String
+    init(_ text: String) { self.text = text }
+
+    var body: some View {
+        Text(text).font(.body).foregroundStyle(.primary).monospacedDigit().textCase(nil)
+            .fixedSize(horizontal: false, vertical: true)
     }
 }
