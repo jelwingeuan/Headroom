@@ -10,4 +10,10 @@ if CommandLine.arguments.count > 1 {
     exit(status)
 }
 
+// Developer-only: HEADROOM_RENDER=<folder> draws every screen from fixtures into PNGs and exits.
+if let out = ProcessInfo.processInfo.environment["HEADROOM_RENDER"] {
+    Screens.render(to: URL(fileURLWithPath: out))
+    exit(0)
+}
+
 HeadroomApp.main()
