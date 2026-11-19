@@ -17,7 +17,6 @@ struct MainView: View {
             }
         }
         .frame(minWidth: 620, minHeight: 400)
-        .tint(.headroom)
         .onAppear {
             model.loadHistory()
             model.loadSettings()
@@ -46,12 +45,13 @@ struct HistoryView: View {
             } else {
                 Table(done.sorted(using: order), sortOrder: $order) {
                     TableColumn("Folder", value: \.name) { FolderCell(action: $0) }.width(min: 160, ideal: 210)
-                    TableColumn("Size", value: \.bytes) { Text(bytes($0.bytes)).monospacedDigit() }
+                    TableColumn("Size", value: \.bytes) { SizeCell(bytes: $0.bytes) }
                         .width(min: 70, ideal: 80, max: 100)
-                    TableColumn("Freed", value: \.when) { WhenCell(date: $0.date) }
+                    TableColumn("Date Freed", value: \.when) { WhenCell(date: $0.date) }
                         .width(min: 80, ideal: 100, max: 130)
-                    TableColumn("") { trailing($0) }.width(min: 100, ideal: 110, max: 130)
+                    TableColumn("Status") { trailing($0) }.width(min: 100, ideal: 110, max: 130)
                 }
+                .tableStyle(.inset(alternatesRowBackgrounds: true))
             }
         }
         .navigationTitle("History")
@@ -80,8 +80,9 @@ struct HistoryView: View {
     static func subtitle(_ actions: [Candidate]) -> String {
         let done = actions.filter { !$0.dryRun }, kept = done.filter { !$0.undone }
         guard !done.isEmpty else { return "" }
-        return "Freed \(bytes(kept.reduce(0) { $0 + $1.bytes })) from \(kept.count) \(kept.count == 1 ? "folder" : "folders")"
-            + (done.count > kept.count ? " · \(done.count - kept.count) rebuilt" : "")
+        let rebuilt = done.count - kept.count
+        return "\(bytes(kept.reduce(0) { $0 + $1.bytes })) freed now"
+            + (rebuilt > 0 ? " · \(rebuilt) of \(done.count) rebuilt" : "")
     }
 
     private func rebuildMessage(_ a: Candidate) -> String {
@@ -95,7 +96,7 @@ struct HistoryView: View {
 
 struct WouldHaveDoneView: View {
     @EnvironmentObject private var model: AppModel
-    @State private var order = [KeyPathComparator(\Candidate.bytes, order: .reverse)]
+    @State private var order: [KeyPathComparator<Candidate>] = [] // the dry run's own order: first to go on top
 
     var body: some View {
         let planned = model.actions.filter(\.dryRun)
@@ -104,17 +105,18 @@ struct WouldHaveDoneView: View {
             if planned.isEmpty {
                 EmptyState(symbol: "eye", title: "Nothing to show yet",
                            detail: noBudget
-                               ? "Set a budget first. For the next 7 days, Headroom then only lists here what it would delete."
-                               : "For its first 7 days, Headroom only lists here what it would delete.",
+                               ? "Set a budget first. For the 7 days after that, this list shows what Headroom would delete."
+                               : "For its first 7 days, this list shows what Headroom would delete.",
                            action: noBudget ? ("Set a Budget…", openSettings) : nil)
             } else {
                 Table(planned.sorted(using: order), sortOrder: $order) {
                     TableColumn("Folder", value: \.name) { FolderCell(action: $0) }.width(min: 160, ideal: 210)
-                    TableColumn("Size", value: \.bytes) { Text(bytes($0.bytes)).monospacedDigit() }
+                    TableColumn("Size", value: \.bytes) { SizeCell(bytes: $0.bytes) }
                         .width(min: 70, ideal: 80, max: 100)
-                    TableColumn("Picked", value: \.when) { WhenCell(date: $0.date) }
+                    TableColumn("Date Found", value: \.when) { WhenCell(date: $0.date) }
                         .width(min: 80, ideal: 100, max: 130)
                 }
+                .tableStyle(.inset(alternatesRowBackgrounds: true))
             }
         }
         .navigationTitle("Dry Run")
@@ -126,7 +128,7 @@ struct WouldHaveDoneView: View {
         guard !planned.isEmpty else { return "" }
         let total = bytes(planned.reduce(0) { $0 + $1.bytes })
         return dryRun ? "Would free \(total). Nothing has been deleted."
-            : "Ended. These \(planned.count) folders (\(total)) would have been freed."
+            : "Ended. It would have freed \(total); Headroom now frees space for real."
     }
 }
 
@@ -137,12 +139,22 @@ struct FolderCell: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(action.name)
-            Text("\(action.what) · \(action.place)")
-                .font(.subheadline).foregroundStyle(.secondary)
-                .lineLimit(1).truncationMode(.middle)
+            HStack(spacing: 0) { // the kind never truncates; the path gives way, in the middle
+                Text(action.what).layoutPriority(1)
+                Text(" · \(action.place)").truncationMode(.middle)
+            }
+            .font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
         }
         .padding(.vertical, 4)
         .help(action.reason ?? "")
+    }
+}
+
+struct SizeCell: View {
+    let bytes: Int64
+
+    var body: some View {
+        Text(Headroom.bytes(bytes)).monospacedDigit().frame(maxWidth: .infinity, alignment: .trailing)
     }
 }
 
@@ -202,7 +214,7 @@ struct SettingsView: View {
                 } footer: {
                     Footnote(binding.wrappedValue.budgetBytes == 0
                         ? "Headroom deletes nothing until you set a budget."
-                        : "When free space drops below your budget, Headroom deletes the files you haven't used for longest, as long as it can rebuild them. It never touches a project you opened within the days above.")
+                        : "When free space drops below your budget, Headroom deletes the files you haven't used in the longest time, as long as it can rebuild them. It never touches a project you opened within the days above.")
                 }
                 Section {
                     Toggle("Only show what Headroom would delete", isOn: binding.dryRun)
@@ -210,7 +222,7 @@ struct SettingsView: View {
                     Text("Dry Run")
                 } footer: {
                     Footnote(binding.wrappedValue.dryRun
-                        ? "Nothing is deleted while this is on. It's on for your first 7 days; its picks appear under Dry Run in the Headroom window."
+                        ? "Nothing is deleted while this is on. It's on for your first 7 days, and what it would delete appears under Dry Run in the Headroom window."
                         : "Off: Headroom frees space for real, and every deletion appears in History.")
                 }
             } else {
@@ -226,7 +238,7 @@ struct SettingsView: View {
                     }
                 }
                 LabeledContent {
-                    Button(model.status.needsFullDiskAccess ? "Allow…" : "Open…") { openFullDiskAccessSettings() }
+                    Button("Open Privacy Settings…") { openFullDiskAccessSettings() }
                 } label: {
                     Text("Full Disk Access")
                     Text(model.status.needsFullDiskAccess ? "Off: some folders can't be measured" : "No folders blocked")
@@ -236,7 +248,6 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .tint(.headroom)
         .frame(width: 460)
         .fixedSize(horizontal: false, vertical: true)
         .onAppear {
