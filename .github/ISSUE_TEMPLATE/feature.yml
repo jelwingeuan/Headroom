@@ -1,0 +1,16 @@
+name: Feature request
+description: Something Headroom should reclaim, or do differently
+labels: [enhancement]
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: What you need
+      description: The folder or tool, roughly how much space it takes on your Mac, and how it gets rebuilt.
+    validations:
+      required: true
+  - type: textarea
+    id: proof
+    attributes:
+      label: How Headroom could prove it's safe
+      description: The marker file, command or signal that shows it can be rebuilt and isn't in use.

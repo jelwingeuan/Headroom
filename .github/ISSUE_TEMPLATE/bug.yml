@@ -1,0 +1,27 @@
+name: Bug report
+description: Something Headroom did, or failed to do
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: "If Headroom deleted or changed something it shouldn't have, please report it privately through the Security tab instead."
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what Headroom did instead.
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: The relevant part of `Headroom scan <folder> --json`, or the History entry. Remove anything private.
+      render: json
+  - type: input
+    id: version
+    attributes:
+      label: Versions
+      description: Headroom version, macOS version, Apple silicon or Intel.
+    validations:
+      required: true
