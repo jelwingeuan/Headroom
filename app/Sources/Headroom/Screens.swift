@@ -70,7 +70,9 @@ enum Screens {
                       dir.appendingPathComponent("settings-\(world)-\(look).png"))
                 for pane in Pane.allCases {
                     let model = AppModel(fixture: fixture, pane: pane)
-                    shoot(MainView().environmentObject(model), size: CGSize(width: 720, height: 480), appearance,
+                    let title = (pane.rawValue, pane == .history ? HistoryView.subtitle(model.actions)
+                        : WouldHaveDoneView.subtitle(model.actions, dryRun: model.status.dryRun))
+                    shoot(MainView().environmentObject(model), size: CGSize(width: 720, height: 480), appearance, title: title,
                           dir.appendingPathComponent("window-\(pane.id.rawValue.lowercased().replacingOccurrences(of: " ", with: "-"))-\(world)-\(look).png"))
                 }
             }
@@ -78,15 +80,26 @@ enum Screens {
     }
 
     /// Hosts the view in an offscreen window so AppKit-backed controls (List, Form, Toggle) draw too.
-    private static func shoot<V: View>(_ view: V, size: CGSize?, _ appearance: NSAppearance, _ url: URL) {
-        let host = NSHostingView(rootView: view)
-        let fit = size ?? host.fittingSize
+    private static func shoot<V: View>(_ view: V, size: CGSize?, _ appearance: NSAppearance, title: (String, String)? = nil,
+                                       _ url: URL) {
+        let controller = NSHostingController(rootView: view)
+        let fit = size ?? controller.view.fittingSize
+        let titled = title != nil
+        let style: NSWindow.StyleMask = titled ? [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
+            : [.borderless]
         let window = KeyWindow(contentRect: CGRect(origin: CGPoint(x: -10_000, y: 0), size: fit),
-                               styleMask: [.borderless], backing: .buffered, defer: false)
+                               styleMask: style, backing: .buffered, defer: false)
         window.appearance = appearance
-        window.contentView = host
+        window.contentViewController = controller // lets SwiftUI set the title, subtitle and toolbar
+        window.setContentSize(fit)
+        if let title { // offscreen, SwiftUI doesn't push navigationTitle into the window: do it here
+            window.title = title.0
+            window.subtitle = title.1
+        }
         window.makeKeyAndOrderFront(nil) // an active window, so selection and switches show their real color
-        RunLoop.main.run(until: Date().addingTimeInterval(0.4))
+        RunLoop.main.run(until: Date().addingTimeInterval(0.5))
+        // A titled window is drawn with its title bar: capture the frame view, not just the content.
+        let host = titled ? (window.contentView?.superview ?? controller.view) : controller.view
         host.layoutSubtreeIfNeeded()
         guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return }
         host.cacheDisplay(in: host.bounds, to: rep)
