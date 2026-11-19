@@ -41,7 +41,7 @@ struct HistoryView: View {
             if done.isEmpty {
                 EmptyState(symbol: "clock.arrow.circlepath", title: "Nothing deleted yet",
                            detail: "When Headroom frees space, each folder shows up here, and you can rebuild it with one click.",
-                           action: ("Open Settings…", openSettings))
+                           action: model.status.budgetBytes == 0 ? ("Set a Budget…", openSettings) : nil)
             } else {
                 List {
                     Section {
@@ -95,11 +95,14 @@ struct WouldHaveDoneView: View {
 
     var body: some View {
         let planned = model.actions.filter(\.dryRun)
+        let noBudget = model.status.budgetBytes == 0
         Group {
             if planned.isEmpty {
                 EmptyState(symbol: "eye", title: "Nothing to show yet",
-                           detail: "For its first 7 days Headroom only shows what it would delete. Its picks appear here.",
-                           action: nil)
+                           detail: noBudget
+                               ? "Choose how much space to keep free first. For its first 7 days Headroom then only shows what it would delete, here."
+                               : "For its first 7 days Headroom only shows what it would delete. Its picks appear here.",
+                           action: noBudget ? ("Set a Budget…", openSettings) : nil)
             } else {
                 List {
                     Section {
@@ -109,7 +112,7 @@ struct WouldHaveDoneView: View {
                             .monospacedDigit()
                     } footer: {
                         if !model.status.dryRun {
-                            Text("The dry run is over. Headroom now frees space for real, and everything it deletes appears in History.")
+                            Footnote("The dry run is over. Headroom now frees space for real, and everything it deletes appears in History.")
                         }
                     }
                 }
@@ -128,7 +131,7 @@ struct ActionRow<Trailing: View>: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(action.name)
                 Text("\(action.what) · \(action.place)")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.subheadline).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.middle)
             }
             Spacer(minLength: 16)
@@ -136,13 +139,12 @@ struct ActionRow<Trailing: View>: View {
                 Text(bytes(action.bytes)).monospacedDigit()
                 if let date = action.date {
                     Text(date, format: .relative(presentation: .named))
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(.subheadline).foregroundStyle(.secondary)
                 }
             }
             HStack(spacing: 4) { trailing }.frame(minWidth: 96, alignment: .trailing)
         }
         .padding(.vertical, 4)
-        .opacity(action.undone ? 0.6 : 1)
         .accessibilityElement(children: .contain)
         .help(action.reason ?? "")
     }
@@ -175,8 +177,12 @@ struct SettingsView: View {
                 Section {
                     LabeledContent("Keep free") {
                         HStack(spacing: 8) {
-                            TextField("Gigabytes", value: binding.budgetGB, format: .number)
+                            TextField("Gigabytes", value: Binding(
+                                get: { binding.wrappedValue.budgetGB == 0 ? nil : binding.wrappedValue.budgetGB },
+                                set: { binding.wrappedValue.budgetGB = $0 ?? 0 }
+                            ), format: .number, prompt: Text("60"))
                                 .labelsHidden().frame(width: 64).multilineTextAlignment(.trailing)
+                                .textFieldStyle(.roundedBorder)
                                 .accessibilityLabel("Space to keep free, in gigabytes")
                             Text("GB")
                         }
@@ -199,7 +205,9 @@ struct SettingsView: View {
                 } header: {
                     Text("Dry Run")
                 } footer: {
-                    Footnote("The dry run is on for your first 7 days. Its picks appear under Dry Run in the Headroom window.")
+                    Footnote(binding.wrappedValue.dryRun
+                        ? "Nothing is deleted while this is on. It's on for your first 7 days; its picks appear under Dry Run in the Headroom window."
+                        : "Off: Headroom frees space for real, and every deletion appears in History.")
                 }
             } else {
                 ProgressView("Loading settings…")
