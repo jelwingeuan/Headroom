@@ -34,15 +34,15 @@ enum Screens {
 
     /// name -> (status reply, history rows, settings reply); each world is self-consistent.
     static let worlds: [(String, JSON, [JSON], JSON)] = [
-        ("first-run", ["free_bytes": 18 * GB, "budget_bytes": 0, "dry_run": true, "dry_run_days_left": 7,
+        ("first-run", ["capacity_bytes": 245 * GB, "free_bytes": 18 * GB, "budget_bytes": 0, "dry_run": true, "dry_run_days_left": 7,
                        "permission_errors": 3], [], settings(0, dryRun: true)),
-        ("dry-run", ["free_bytes": 52 * GB, "budget_bytes": 60 * GB, "dry_run": true, "dry_run_days_left": 4,
+        ("dry-run", ["capacity_bytes": 245 * GB, "free_bytes": 52 * GB, "budget_bytes": 60 * GB, "dry_run": true, "dry_run_days_left": 4,
                      "next": wouldHave[1], "reclaimable_bytes": 38 * GB, "protected_bytes": 21 * GB],
          wouldHave, settings(60, dryRun: true)),
-        ("plenty", ["free_bytes": 112 * GB, "budget_bytes": 60 * GB, "dry_run": false,
+        ("plenty", ["capacity_bytes": 245 * GB, "free_bytes": 112 * GB, "budget_bytes": 60 * GB, "dry_run": false,
                     "reclaimable_bytes": 24 * GB, "protected_bytes": 19 * GB],
          done + wouldHave, settings(60, dryRun: false)),
-        ("acting", ["free_bytes": 57 * GB, "budget_bytes": 60 * GB, "dry_run": false, "next": done[1],
+        ("acting", ["capacity_bytes": 245 * GB, "free_bytes": 57 * GB, "budget_bytes": 60 * GB, "dry_run": false, "next": done[1],
                     "snapshot_holding": true, "reclaimable_bytes": 9 * GB], done, settings(60, dryRun: false)),
         ("error", ["error": "Headroom's core gave no reply. Quit and reopen Headroom."], [], settings(60, dryRun: false)),
     ]

@@ -48,11 +48,15 @@ struct Status: Equatable {
     var snapshotHolding = false
     /// From the last scan (at most a day old); nil until one has run.
     var canComeBack: Int64?
+    /// Size of the disk that holds the home folder: the chart's fixed scale.
+    var capacityBytes: Int64?
     var protectedBytes: Int64?
     var error: String?
 
     init(_ j: JSON) {
         canComeBack = j.int("reclaimable_bytes")
+        capacityBytes = j.int("capacity_bytes") ?? (try? URL(fileURLWithPath: NSHomeDirectory())
+            .resourceValues(forKeys: [.volumeTotalCapacityKey]).volumeTotalCapacity).map(Int64.init)
         protectedBytes = j.int("protected_bytes")
         freeBytes = j.int("free_bytes")
         budgetBytes = j.int("budget_bytes")
