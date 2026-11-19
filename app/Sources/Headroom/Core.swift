@@ -99,7 +99,10 @@ struct Candidate: Equatable, Identifiable {
     /// "app" for ~/code/app/node_modules; "Foo-abc" for DerivedData/Foo-abc.
     var name: String {
         let last = (path as NSString).lastPathComponent
-        return last == kind ? (place as NSString).lastPathComponent : last
+        if last == kind { return (place as NSString).lastPathComponent }
+        // Xcode names DerivedData folders "<Project>-<28-letter hash>"; people know the project.
+        if place.hasSuffix("DerivedData"), let dash = last.lastIndex(of: "-") { return String(last[..<dash]) }
+        return last
     }
 
     /// The kind in plain words, for people who don't know the tool's folder names.
