@@ -93,6 +93,9 @@ struct Candidate: Equatable, Identifiable {
         rebuild = j.string("rebuild")
     }
 
+    /// For sorting: rows without a time sort as oldest.
+    var when: Date { date ?? .distantPast }
+
     var shortPath: String { (path as NSString).abbreviatingWithTildeInPath }
     /// The folder that holds it, e.g. "~/code/app" for "~/code/app/node_modules".
     var place: String { (shortPath as NSString).deletingLastPathComponent }
