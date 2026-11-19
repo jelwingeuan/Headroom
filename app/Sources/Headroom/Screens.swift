@@ -28,18 +28,23 @@ enum Screens {
         row("d2", "/Users/me/code/game/target", "target", 6.3, daysAgo: 1, dryRun: true),
         row("d3", "/Users/me/.ollama/models/llama3.2", "model", 2.0, daysAgo: 2, dryRun: true),
     ]
-    static let settings: JSON = ["budget_bytes": 60 * GB, "recent_days": 14, "dry_run": true]
+    static func settings(_ budgetGB: Int64, dryRun: Bool) -> JSON {
+        ["budget_bytes": budgetGB * GB, "recent_days": 14, "dry_run": dryRun]
+    }
 
-    /// name -> (status reply, history rows)
-    static let worlds: [(String, JSON, [JSON])] = [
+    /// name -> (status reply, history rows, settings reply); each world is self-consistent.
+    static let worlds: [(String, JSON, [JSON], JSON)] = [
         ("first-run", ["free_bytes": 18 * GB, "budget_bytes": 0, "dry_run": true, "dry_run_days_left": 7,
-                       "permission_errors": 3], []),
+                       "permission_errors": 3], [], settings(0, dryRun: true)),
         ("dry-run", ["free_bytes": 52 * GB, "budget_bytes": 60 * GB, "dry_run": true, "dry_run_days_left": 4,
-                     "next": wouldHave[1]], wouldHave),
-        ("plenty", ["free_bytes": 112 * GB, "budget_bytes": 60 * GB, "dry_run": false], done + wouldHave),
+                     "next": wouldHave[1], "reclaimable_bytes": 38 * GB, "protected_bytes": 21 * GB],
+         wouldHave, settings(60, dryRun: true)),
+        ("plenty", ["free_bytes": 112 * GB, "budget_bytes": 60 * GB, "dry_run": false,
+                    "reclaimable_bytes": 24 * GB, "protected_bytes": 19 * GB],
+         done + wouldHave, settings(60, dryRun: false)),
         ("acting", ["free_bytes": 57 * GB, "budget_bytes": 60 * GB, "dry_run": false, "next": done[1],
-                    "snapshot_holding": true], done),
-        ("error", ["error": "Headroom's core gave no reply. Quit and reopen Headroom."], []),
+                    "snapshot_holding": true, "reclaimable_bytes": 9 * GB], done, settings(60, dryRun: false)),
+        ("error", ["error": "Headroom's core gave no reply. Quit and reopen Headroom."], [], settings(60, dryRun: false)),
     ]
 
     static let looks: [(String, NSAppearance.Name)] = [
@@ -51,7 +56,7 @@ enum Screens {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        for (world, status, rows) in worlds {
+        for (world, status, rows, settings) in worlds {
             let fixture: JSON = ["status": status, "history": ["actions": rows], "settings_get": settings]
             for (look, name) in looks {
                 let appearance = NSAppearance(named: name)!
@@ -61,6 +66,8 @@ enum Screens {
                 shoot(MenuBarIcon(status: menu.status, paused: false).font(.system(size: 14)).padding(4),
                       size: nil, appearance, dir.appendingPathComponent("icon-\(world)-\(look).png"))
                 guard world == "plenty" || world == "first-run" else { continue }
+                shoot(SettingsView().environmentObject(menu), size: nil, appearance,
+                      dir.appendingPathComponent("settings-\(world)-\(look).png"))
                 for pane in Pane.allCases {
                     let model = AppModel(fixture: fixture, pane: pane)
                     shoot(MainView().environmentObject(model), size: CGSize(width: 720, height: 480), appearance,
@@ -74,11 +81,11 @@ enum Screens {
     private static func shoot<V: View>(_ view: V, size: CGSize?, _ appearance: NSAppearance, _ url: URL) {
         let host = NSHostingView(rootView: view)
         let fit = size ?? host.fittingSize
-        let window = NSWindow(contentRect: CGRect(origin: CGPoint(x: -10_000, y: 0), size: fit),
-                              styleMask: [.borderless], backing: .buffered, defer: false)
+        let window = KeyWindow(contentRect: CGRect(origin: CGPoint(x: -10_000, y: 0), size: fit),
+                               styleMask: [.borderless], backing: .buffered, defer: false)
         window.appearance = appearance
         window.contentView = host
-        window.orderFrontRegardless()
+        window.makeKeyAndOrderFront(nil) // an active window, so selection and switches show their real color
         RunLoop.main.run(until: Date().addingTimeInterval(0.4))
         host.layoutSubtreeIfNeeded()
         guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return }
@@ -86,4 +93,9 @@ enum Screens {
         try? rep.representation(using: .png, properties: [:])?.write(to: url)
         window.orderOut(nil)
     }
+}
+
+private final class KeyWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
 }
