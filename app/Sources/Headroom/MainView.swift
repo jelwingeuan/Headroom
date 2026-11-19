@@ -16,7 +16,7 @@ struct MainView: View {
             case .wouldHaveDone: WouldHaveDoneView()
             }
         }
-        .frame(minWidth: 620, minHeight: 400)
+        .frame(minWidth: 720, minHeight: 400)
         .onAppear {
             model.loadHistory()
             model.loadSettings()
@@ -44,12 +44,26 @@ struct HistoryView: View {
                            action: model.status.budgetBytes == 0 ? ("Set a Budget…", openSettings) : nil)
             } else {
                 Table(done.sorted(using: order), sortOrder: $order) {
-                    TableColumn("Folder", value: \.name) { FolderCell(action: $0) }.width(min: 160, ideal: 210)
+                    TableColumn("Folder", value: \.name) { FolderCell(action: $0) }.width(min: 160, ideal: 200, max: 220)
                     TableColumn("Size", value: \.bytes) { SizeCell(bytes: $0.bytes) }
                         .width(min: 70, ideal: 80, max: 100)
                     TableColumn("Date Freed", value: \.when) { WhenCell(date: $0.date) }
-                        .width(min: 80, ideal: 100, max: 130)
-                    TableColumn("Status") { trailing($0) }.width(min: 100, ideal: 110, max: 130)
+                        .width(min: 100, ideal: 110, max: 130)
+                    TableColumn("Status") { StatusCell(action: $0, rebuilding: model.undoing.contains($0.id)) }
+                        .width(min: 70, ideal: 80, max: 100)
+                    TableColumn("") { action in
+                        if !action.undone && !model.undoing.contains(action.id) {
+                            Button("\(action.rebuildVerb)…") { asking = action }
+                                .buttonStyle(.bordered).controlSize(.small)
+                                .accessibilityLabel("\(action.rebuildVerb) \(action.name)")
+                        }
+                    }
+                    .width(min: 90, ideal: 100, max: 120)
+                }
+                .contextMenu(forSelectionType: Candidate.ID.self) { ids in
+                    if let id = ids.first, let action = done.first(where: { $0.id == id }), !action.undone {
+                        Button("\(action.rebuildVerb)…") { asking = action }
+                    }
                 }
                 .tableStyle(.inset(alternatesRowBackgrounds: true))
             }
@@ -66,22 +80,12 @@ struct HistoryView: View {
         }
     }
 
-    @ViewBuilder private func trailing(_ action: Candidate) -> some View {
-        if action.undone {
-            Label("Rebuilt", systemImage: "checkmark").foregroundStyle(.secondary)
-        } else if model.undoing.contains(action.id) {
-            Text("Rebuilding…").foregroundStyle(.secondary)
-        } else {
-            Button("\(action.rebuildVerb)…") { asking = action }
-                .accessibilityLabel("\(action.rebuildVerb) \(action.name)")
-        }
-    }
 
     static func subtitle(_ actions: [Candidate]) -> String {
         let done = actions.filter { !$0.dryRun }, kept = done.filter { !$0.undone }
         guard !done.isEmpty else { return "" }
         let rebuilt = done.count - kept.count
-        return "\(bytes(kept.reduce(0) { $0 + $1.bytes })) freed now"
+        return "\(bytes(kept.reduce(0) { $0 + $1.bytes })) freed"
             + (rebuilt > 0 ? " · \(rebuilt) of \(done.count) rebuilt" : "")
     }
 
@@ -110,11 +114,11 @@ struct WouldHaveDoneView: View {
                            action: noBudget ? ("Set a Budget…", openSettings) : nil)
             } else {
                 Table(planned.sorted(using: order), sortOrder: $order) {
-                    TableColumn("Folder", value: \.name) { FolderCell(action: $0) }.width(min: 160, ideal: 210)
+                    TableColumn("Folder", value: \.name) { FolderCell(action: $0) }.width(min: 160, ideal: 200, max: 220)
                     TableColumn("Size", value: \.bytes) { SizeCell(bytes: $0.bytes) }
                         .width(min: 70, ideal: 80, max: 100)
                     TableColumn("Date Found", value: \.when) { WhenCell(date: $0.date) }
-                        .width(min: 80, ideal: 100, max: 130)
+                        .width(min: 100, ideal: 110, max: 130)
                 }
                 .tableStyle(.inset(alternatesRowBackgrounds: true))
             }
@@ -128,7 +132,7 @@ struct WouldHaveDoneView: View {
         guard !planned.isEmpty else { return "" }
         let total = bytes(planned.reduce(0) { $0 + $1.bytes })
         return dryRun ? "Would free \(total). Nothing has been deleted."
-            : "Ended. It would have freed \(total); Headroom now frees space for real."
+            : "Ended · would have freed \(total)"
     }
 }
 
@@ -147,6 +151,21 @@ struct FolderCell: View {
         }
         .padding(.vertical, 4)
         .help(action.reason ?? "")
+    }
+}
+
+struct StatusCell: View {
+    let action: Candidate
+    let rebuilding: Bool
+
+    var body: some View {
+        if rebuilding {
+            Text("Rebuilding…").foregroundStyle(.secondary)
+        } else if action.undone {
+            Label("Rebuilt", systemImage: "checkmark").foregroundStyle(.secondary)
+        } else {
+            Text("Freed").foregroundStyle(.secondary)
+        }
     }
 }
 
@@ -238,7 +257,7 @@ struct SettingsView: View {
                     }
                 }
                 LabeledContent {
-                    Button("Open Privacy Settings…") { openFullDiskAccessSettings() }
+                    Button("Full Disk Access Settings…") { openFullDiskAccessSettings() }
                 } label: {
                     Text("Full Disk Access")
                     Text(model.status.needsFullDiskAccess ? "Off: some folders can't be measured" : "No folders blocked")

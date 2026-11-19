@@ -72,7 +72,7 @@ enum Screens {
                     let model = AppModel(fixture: fixture, pane: pane)
                     let title = (pane.rawValue, pane == .history ? HistoryView.subtitle(model.actions)
                         : WouldHaveDoneView.subtitle(model.actions, dryRun: model.status.dryRun))
-                    shoot(MainView().environmentObject(model), size: CGSize(width: 720, height: 480), appearance, title: title,
+                    shoot(MainView().environmentObject(model), size: CGSize(width: 800, height: 500), appearance, title: title,
                           dir.appendingPathComponent("window-\(pane.id.rawValue.lowercased().replacingOccurrences(of: " ", with: "-"))-\(world)-\(look).png"))
                 }
             }
