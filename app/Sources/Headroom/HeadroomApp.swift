@@ -32,10 +32,10 @@ enum Mood {
         switch self {
         case .unknown, .noBudget: "gauge.with.dots.needle.bottom.0percent"
         case .paused: "pause.circle"
-        case .plenty: "checkmark.circle"
-        case .dryRun: "eye.circle"
-        case .acting: "minus.circle"
-        case .stuck, .failed: "exclamationmark.circle"
+        case .plenty: "gauge.with.dots.needle.67percent"
+        case .dryRun: "gauge.with.dots.needle.33percent"
+        case .acting: "gauge.badge.minus"
+        case .stuck, .failed: "exclamationmark.triangle"
         }
     }
 
@@ -77,36 +77,30 @@ struct MenuBarIcon: View {
     }
 }
 
-/// The one chart: free space against the budget line, with what could still come back.
-/// The scale runs from 0 to the larger of the budget and free space, plus a margin, so the
-/// budget line sits where it truly is.
+/// The one chart, drawn the way Finder draws a disk: used space fills from the left, free space
+/// is the empty track on the right. The scale is the whole disk, so it never changes between
+/// states, and the budget tick sits where free space would equal the budget.
 struct SpaceBar: View {
+    let capacity: Int64
     let free: Int64
     let budget: Int64
-    let canComeBack: Int64?
+    let canBeFreed: Int64?
     /// Bytes Headroom is freeing right now (only while acting); drawn in Headroom's teal.
     var freeing: Int64 = 0
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        // The track ends at the larger of the budget and what free space could reach: no padding.
-        let top = Double(max(free + (canComeBack ?? 0), budget))
-        let f = Double(free) / top, b = Double(budget) / top
-        let now = Double(min(freeing, canComeBack ?? 0)) / top
-        let back = Double(canComeBack ?? 0) / top - now
-        // Free is always the same color; teal appears only on what Headroom is freeing right now.
-        let freeColor = Color.primary.opacity(0.32)
+        let cap = Double(max(capacity, free + 1))
+        let now = Double(min(freeing, canBeFreed ?? 0))
+        let back = Double(canBeFreed ?? 0) - now
+        let used = cap - Double(free) - now - back
         VStack(alignment: .leading, spacing: 6) {
             GeometryReader { geo in
-                let w = geo.size.width
-                // Segments sit apart by a 2 pt gap, so they read as separate without relying on hue.
+                let w = geo.size.width, x = { (b: Double) in max(w * b / cap - 1, 2) }
                 HStack(spacing: 2) {
-                    Rectangle().fill(freeColor).frame(width: max(w * f - 1, 2))
-                    if now > 0 { Rectangle().fill(Color.headroom).frame(width: max(w * now - 1, 2)) }
-                    if back > 0 {
-                        // Outlined, not filled: reads apart from Free by shape, not only by shade.
-                        Rectangle().strokeBorder(Color.secondary, lineWidth: 1.5).frame(width: max(w * back - 1, 2))
-                    }
+                    Rectangle().fill(Color.primary.opacity(0.55)).frame(width: x(max(used, 0)))
+                    if now > 0 { Rectangle().fill(Color.headroom).frame(width: x(now)) }
+                    if back > 0 { HatchedBar().frame(width: x(back)) }
                     Rectangle().fill(.quaternary)
                 }
                 .clipShape(Capsule())
@@ -114,34 +108,52 @@ struct SpaceBar: View {
                     // The budget line: label color with a ring of the background, legible on any segment.
                     Rectangle().fill(.primary).frame(width: 2, height: 18)
                         .background(Rectangle().fill(.background).frame(width: 4, height: 20))
-                        .offset(x: w * b - 1)
+                        .offset(x: w * (1 - Double(budget) / cap) - 1)
                 }
             }
             .frame(height: 10)
             .padding(.vertical, 4)
-            let swatches = HStack(spacing: 12) {
-                Swatch(style: .fill(freeColor), text: "Free")
-                if now > 0 { Swatch(style: .fill(.headroom), text: "Freeing now") }
-                if back > 0 { Swatch(style: .outline, text: "Can be freed") }
+            HStack(spacing: 12) {
+                Swatch(style: .fill(Color.primary.opacity(0.55)), text: "Used")
+                if now > 0 { Swatch(style: .fill(.headroom), text: "Freeing") }
+                if back > 0 { Swatch(style: .hatched, text: "Can be freed") }
+                Swatch(style: .track, text: "Free")
             }
-            let budgetLabel = Label("\(bytes(budget)) budget", systemImage: "line.diagonal").labelStyle(BudgetLabelStyle())
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 12) { swatches; Spacer(minLength: 0); budgetLabel }
-                VStack(alignment: .leading, spacing: 4) { swatches; budgetLabel }
+            HStack {
+                Label("\(bytes(budget)) budget", systemImage: "line.diagonal").labelStyle(BudgetLabelStyle())
+                Spacer()
+                Text("\(bytes(capacity)) disk").foregroundStyle(.secondary).monospacedDigit()
             }
-            .font(.subheadline)
         }
+        .font(.subheadline)
         .animation(reduceMotion ? .easeInOut(duration: 0.2) : .spring(response: 0.4, dampingFraction: 1),
                    value: free)
         .accessibilityElement()
-        .accessibilityLabel("Free space chart")
-        .accessibilityValue("\(bytes(free)) free, budget \(bytes(budget))"
-            + (canComeBack.map { ", \(bytes($0)) more can be freed" } ?? ""))
+        .accessibilityLabel("Disk")
+        .accessibilityValue("\(bytes(free)) free of \(bytes(capacity)), budget \(bytes(budget))"
+            + (canBeFreed.map { ", \(bytes($0)) can be freed" } ?? ""))
+    }
+}
+
+/// Diagonal stripes: "can be freed" reads apart from used space by pattern, not by shade.
+struct HatchedBar: View {
+    var body: some View {
+        Canvas { ctx, size in
+            ctx.fill(Path(CGRect(origin: .zero, size: size)), with: .color(Color.primary.opacity(0.12)))
+            var x: CGFloat = -size.height
+            while x < size.width {
+                var p = Path()
+                p.move(to: CGPoint(x: x, y: size.height))
+                p.addLine(to: CGPoint(x: x + size.height, y: 0))
+                ctx.stroke(p, with: .color(Color.primary.opacity(0.55)), lineWidth: 1.5)
+                x += 4
+            }
+        }
     }
 }
 
 struct Swatch: View {
-    enum Style { case fill(Color), outline }
+    enum Style { case fill(Color), hatched, track }
     let style: Style
     let text: String
 
@@ -150,7 +162,9 @@ struct Swatch: View {
             Group {
                 switch style {
                 case .fill(let c): RoundedRectangle(cornerRadius: 2).fill(c)
-                case .outline: RoundedRectangle(cornerRadius: 2).strokeBorder(Color.secondary, lineWidth: 1.5)
+                case .hatched: HatchedBar().clipShape(RoundedRectangle(cornerRadius: 2))
+                case .track: RoundedRectangle(cornerRadius: 2).fill(.quaternary)
+                    .overlay(RoundedRectangle(cornerRadius: 2).strokeBorder(Color.secondary.opacity(0.6)))
                 }
             }
             .frame(width: 10, height: 10)
@@ -191,7 +205,7 @@ struct MenuView: View {
             }
 
             if let free = s.freeBytes, let budget = s.budgetBytes, budget > 0 {
-                SpaceBar(free: free, budget: budget, canComeBack: s.canComeBack,
+                SpaceBar(capacity: s.capacityBytes ?? free, free: free, budget: budget, canBeFreed: s.canComeBack,
                          freeing: mood == .acting ? s.next?.bytes ?? 0 : 0)
             }
 
@@ -203,7 +217,7 @@ struct MenuView: View {
 
             if s.snapshotHolding {
                 Notice(symbol: "clock.badge.exclamationmark",
-                       text: "A Time Machine snapshot is holding some freed space. macOS releases it within a day.")
+                       text: "A Time Machine snapshot holds some freed space for up to a day.")
             }
             if s.needsFullDiskAccess {
                 Notice(symbol: "lock.shield",
@@ -212,18 +226,19 @@ struct MenuView: View {
             }
 
             Divider()
-            VStack(spacing: 0) {
-                MenuRow("Open Headroom", shortcut: "o") { open(.history) }
-                MenuRow("Settings…", shortcut: ",") { openSettings() }
-                MenuRow(model.paused ? "Resume Headroom" : "Pause Headroom",
-                        disabled: mood == .noBudget || mood == .failed) { model.paused.toggle() }
-                Divider().padding(.vertical, 4)
-                MenuRow("Quit Headroom", shortcut: "q") { NSApp.terminate(nil) }
+            // Real controls, not imitation menu items: a window-style extra gets a footer bar.
+            HStack(spacing: 8) {
+                Button("Open Headroom") { open(.history) }.keyboardShortcut("o")
+                Spacer()
+                IconButton(model.paused ? "Resume Headroom" : "Pause Headroom",
+                           symbol: model.paused ? "play.fill" : "pause.fill") { model.paused.toggle() }
+                    .disabled(mood == .noBudget || mood == .failed)
+                IconButton("Settings", symbol: "gearshape") { openSettings() }.keyboardShortcut(",")
+                IconButton("Quit Headroom", symbol: "power") { NSApp.terminate(nil) }.keyboardShortcut("q")
             }
         }
         .padding(16)
         .frame(width: 320)
-        .tint(.headroom)
         .onAppear {
             model.refresh()
             model.loadHistory()
@@ -237,7 +252,6 @@ struct MenuView: View {
         var parts: [String] = []
         if let back = s.canComeBack, back > 0 { parts.append("\(bytes(back)) can be freed") }
         switch mood {
-        case .acting: parts.append("freeing space")
         case .paused: parts.append("paused")
         default: break
         }
@@ -266,7 +280,8 @@ struct MenuView: View {
         case .acting:
             if let next = s.next {
                 Notice(symbol: mood.symbol,
-                       text: "\(bytes(gap)) below your budget. Freeing \(bytes(next.bytes)) of \(next.what) in \(next.name).")
+                       text: "\(bytes(gap)) below your budget. Freeing \(bytes(next.bytes)) of \(next.what) in \(next.name).",
+                       tint: .headroom)
             }
         case .stuck:
             Notice(symbol: mood.symbol,
@@ -305,13 +320,14 @@ struct Notice: View {
     let text: String
     var action: (String, () -> Void)?
     var prominent = false
+    var tint: Color = .secondary
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Group {
                 Image(systemName: symbol)
             }
-            .foregroundStyle(.secondary)
+            .foregroundStyle(tint)
             .frame(width: 20)
             VStack(alignment: .leading, spacing: 8) {
                 Text(text).fixedSize(horizontal: false, vertical: true)
@@ -354,47 +370,22 @@ struct WouldDoList: View {
     }
 }
 
-/// A command row that looks and behaves like a menu item.
-struct MenuRow: View {
+/// A borderless symbol button with a tooltip and a spoken name.
+struct IconButton: View {
     let title: String
-    let shortcut: KeyEquivalent?
-    let disabled: Bool
+    let symbol: String
     let action: () -> Void
-    @State private var hover = false
 
-    init(_ title: String, shortcut: KeyEquivalent? = nil, disabled: Bool = false, action: @escaping () -> Void) {
+    init(_ title: String, symbol: String, action: @escaping () -> Void) {
         self.title = title
-        self.shortcut = shortcut
-        self.disabled = disabled
+        self.symbol = symbol
         self.action = action
     }
 
     var body: some View {
-        Button(action: action) {
-            HStack {
-                Text(title)
-                Spacer()
-                if let shortcut {
-                    Text("⌘\(String(shortcut.character).uppercased())").foregroundStyle(.secondary)
-                }
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .contentShape(Rectangle())
-            .background(hover && !disabled ? Color.accentColor.opacity(0.85) : .clear,
-                        in: RoundedRectangle(cornerRadius: 4))
-            .foregroundStyle(hover && !disabled ? Color.white : Color.primary)
-        }
-        .buttonStyle(.plain)
-        .disabled(disabled)
-        .onHover { hover = $0 }
-        .commandShortcut(shortcut)
-        .padding(.horizontal, -8)
-    }
-}
-
-extension View {
-    @ViewBuilder func commandShortcut(_ key: KeyEquivalent?) -> some View {
-        if let key { keyboardShortcut(key, modifiers: .command) } else { self }
+        Button(action: action) { Image(systemName: symbol).frame(width: 20, height: 20) }
+            .buttonStyle(.borderless)
+            .help(title)
+            .accessibilityLabel(title)
     }
 }
