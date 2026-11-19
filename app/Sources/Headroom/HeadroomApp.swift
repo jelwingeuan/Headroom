@@ -34,7 +34,7 @@ enum Mood {
         case .paused: "pause.circle"
         case .plenty: "checkmark.circle"
         case .dryRun: "eye.circle"
-        case .acting: "arrow.triangle.2.circlepath.circle"
+        case .acting: "minus.circle"
         case .stuck, .failed: "exclamationmark.circle"
         }
     }
@@ -95,8 +95,7 @@ struct SpaceBar: View {
         let now = Double(min(freeing, canComeBack ?? 0)) / top
         let back = Double(canComeBack ?? 0) / top - now
         // Free is always the same color; teal appears only on what Headroom is freeing right now.
-        let freeColor = Color.primary.opacity(0.7)
-        let backColor = Color.secondary.opacity(0.45)
+        let freeColor = Color.primary.opacity(0.32)
         VStack(alignment: .leading, spacing: 6) {
             GeometryReader { geo in
                 let w = geo.size.width
@@ -104,7 +103,10 @@ struct SpaceBar: View {
                 HStack(spacing: 2) {
                     Rectangle().fill(freeColor).frame(width: max(w * f - 1, 2))
                     if now > 0 { Rectangle().fill(Color.headroom).frame(width: max(w * now - 1, 2)) }
-                    if back > 0 { Rectangle().fill(backColor).frame(width: max(w * back - 1, 2)) }
+                    if back > 0 {
+                        // Outlined, not filled: reads apart from Free by shape, not only by shade.
+                        Rectangle().strokeBorder(Color.secondary, lineWidth: 1.5).frame(width: max(w * back - 1, 2))
+                    }
                     Rectangle().fill(.quaternary)
                 }
                 .clipShape(Capsule())
@@ -118,9 +120,9 @@ struct SpaceBar: View {
             .frame(height: 10)
             .padding(.vertical, 4)
             let swatches = HStack(spacing: 12) {
-                Swatch(color: freeColor, text: "Free")
-                if now > 0 { Swatch(color: .headroom, text: "Freeing now") }
-                if back > 0 { Swatch(color: backColor, text: "Can be freed") }
+                Swatch(style: .fill(freeColor), text: "Free")
+                if now > 0 { Swatch(style: .fill(.headroom), text: "Freeing now") }
+                if back > 0 { Swatch(style: .outline, text: "Can be freed") }
             }
             let budgetLabel = Label("\(bytes(budget)) budget", systemImage: "line.diagonal").labelStyle(BudgetLabelStyle())
             ViewThatFits(in: .horizontal) {
@@ -139,12 +141,19 @@ struct SpaceBar: View {
 }
 
 struct Swatch: View {
-    let color: Color
+    enum Style { case fill(Color), outline }
+    let style: Style
     let text: String
 
     var body: some View {
         HStack(spacing: 4) {
-            RoundedRectangle(cornerRadius: 2).fill(color).frame(width: 10, height: 10)
+            Group {
+                switch style {
+                case .fill(let c): RoundedRectangle(cornerRadius: 2).fill(c)
+                case .outline: RoundedRectangle(cornerRadius: 2).strokeBorder(Color.secondary, lineWidth: 1.5)
+                }
+            }
+            .frame(width: 10, height: 10)
             Text(text).foregroundStyle(.secondary).fixedSize()
         }
     }
@@ -228,8 +237,6 @@ struct MenuView: View {
         var parts: [String] = []
         if let back = s.canComeBack, back > 0 { parts.append("\(bytes(back)) can be freed") }
         switch mood {
-        case .plenty: parts.append("nothing to do")
-        case .dryRun: parts.append("nothing will be deleted yet")
         case .acting: parts.append("freeing space")
         case .paused: parts.append("paused")
         default: break
@@ -246,12 +253,12 @@ struct MenuView: View {
                    action: ("Try Again", { model.refresh() }), prominent: true)
         case .noBudget:
             Notice(symbol: mood.symbol,
-                   text: "Choose how much space to keep free. Headroom won't delete anything until you do.",
+                   text: "Set a budget: the free space Headroom keeps for you. Until then, it deletes nothing.",
                    action: ("Set a Budget…", openSettings), prominent: true)
         case .paused:
             Notice(symbol: mood.symbol, text: "Paused. Nothing will be deleted until you resume.")
         case .plenty:
-            Notice(symbol: mood.symbol, text: "\(bytes(-gap)) above your budget. Nothing to do.")
+            Notice(symbol: mood.symbol, text: "\(bytes(-gap)) above your budget, so there's nothing to do.")
         case .dryRun:
             let days = s.dryRunDaysLeft ?? 0
             Notice(symbol: mood.symbol, text: "\(bytes(gap)) below your budget. This is a dry run, so nothing is deleted"
@@ -259,8 +266,7 @@ struct MenuView: View {
         case .acting:
             if let next = s.next {
                 Notice(symbol: mood.symbol,
-                       text: "\(bytes(gap)) below your budget. Freeing \(bytes(next.bytes)) of \(next.what) in \(next.name).",
-                       busy: true)
+                       text: "\(bytes(gap)) below your budget. Freeing \(bytes(next.bytes)) of \(next.what) in \(next.name).")
             }
         case .stuck:
             Notice(symbol: mood.symbol,
@@ -299,12 +305,11 @@ struct Notice: View {
     let text: String
     var action: (String, () -> Void)?
     var prominent = false
-    var busy = false
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
             Group {
-                if busy { ProgressView().controlSize(.small) } else { Image(systemName: symbol) }
+                Image(systemName: symbol)
             }
             .foregroundStyle(.secondary)
             .frame(width: 20)
