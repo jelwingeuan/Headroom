@@ -30,6 +30,16 @@ final class AppModel: ObservableObject {
 
     private var timers: [DispatchSourceTimer] = []
 
+    /// Screenshot mode: load everything synchronously from Core.fixture, no timers.
+    init(fixture: JSON, pane: Pane) {
+        Core.fixture = fixture
+        status = Status(Core.call(["op": "status"]))
+        let h = Core.call(["op": "history"])
+        actions = (h.objects("actions") + h.objects("items")).map(Candidate.init)
+        settings = Settings(Core.call(["op": "settings_get"]))
+        self.pane = pane
+    }
+
     init() {
         if UserDefaults.standard.object(forKey: "lastDigest") == nil {
             UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "lastDigest")

@@ -9,8 +9,12 @@ enum Core {
     /// headroom_call is not assumed to be thread-safe, so every call goes through this queue.
     static let queue = DispatchQueue(label: "io.github.jelwingeuan.headroom.core", qos: .utility)
 
+    /// Screenshot mode only (see Screens.swift): canned replies by op, so every render is identical.
+    static var fixture: JSON?
+
     /// Blocking; call it on `queue`.
     static func call(_ request: JSON) -> JSON {
+        if let fixture { return fixture[request["op"] as? String ?? ""] as? JSON ?? ["error": "no fixture"] }
         guard let data = try? JSONSerialization.data(withJSONObject: request),
               let text = String(data: data, encoding: .utf8)
         else { return ["error": "Headroom couldn't encode a request. Please report this bug."] }
