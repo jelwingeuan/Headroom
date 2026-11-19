@@ -9,12 +9,11 @@ struct MainView: View {
             List(Pane.allCases, selection: $model.pane) { pane in
                 Label(pane.rawValue, systemImage: pane.symbol)
             }
-            .navigationSplitViewColumnWidth(min: 170, ideal: 190)
+            .navigationSplitViewColumnWidth(min: 160, ideal: 180)
         } detail: {
             switch model.pane ?? .history {
             case .history: HistoryView()
             case .wouldHaveDone: WouldHaveDoneView()
-            case .settings: SettingsView()
             }
         }
         .frame(minWidth: 620, minHeight: 400)
@@ -33,31 +32,61 @@ struct MainView: View {
 
 struct HistoryView: View {
     @EnvironmentObject private var model: AppModel
+    @State private var asking: Candidate?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         let done = model.actions.filter { !$0.dryRun }
         Group {
             if done.isEmpty {
                 EmptyState(symbol: "clock.arrow.circlepath", title: "Nothing deleted yet",
-                           detail: "Everything Headroom deletes shows up here, with Undo to rebuild it.")
+                           detail: "When Headroom frees space, each folder shows up here, and you can rebuild it with one click.",
+                           action: ("Open Settings…", openSettings))
             } else {
-                List(done) { action in
-                    ActionRow(action: action) {
-                        if action.undone {
-                            Text("Undone").foregroundStyle(.secondary)
-                        } else if model.undoing.contains(action.id) {
-                            ProgressView().controlSize(.small)
-                            Text("Rebuilding…").foregroundStyle(.secondary)
-                        } else {
-                            Button("Undo") { model.undo(action) }
-                                .help(action.rebuild.map { "Rebuild it by running: \($0)" }
-                                    ?? "Rebuild it by running its install or build command again")
+                List {
+                    Section {
+                        ForEach(done) { action in
+                            ActionRow(action: action) { trailing(action) }
                         }
+                    } header: {
+                        let freed = done.filter { !$0.undone }.reduce(0) { $0 + $1.bytes }
+                        Text("Headroom freed \(bytes(freed)) from \(done.filter { !$0.undone }.count) folders")
+                            .monospacedDigit()
                     }
                 }
+                .animation(reduceMotion ? .easeInOut(duration: 0.2) : .spring(response: 0.35, dampingFraction: 1),
+                           value: done.map(\.undone))
             }
         }
         .navigationTitle("History")
+        .confirmationDialog(asking.map { "\($0.rebuildVerb) \($0.name)?" } ?? "",
+                            isPresented: Binding(get: { asking != nil }, set: { if !$0 { asking = nil } }),
+                            presenting: asking) { action in
+            Button(action.rebuildVerb) { model.undo(action) }
+            Button("Cancel", role: .cancel) {}
+        } message: { action in
+            Text(rebuildMessage(action))
+        }
+    }
+
+    @ViewBuilder private func trailing(_ action: Candidate) -> some View {
+        if action.undone {
+            Label("Rebuilt", systemImage: "checkmark").labelStyle(.titleAndIcon).foregroundStyle(.secondary)
+        } else if model.undoing.contains(action.id) {
+            ProgressView().controlSize(.small)
+            Text("Rebuilding…").foregroundStyle(.secondary)
+        } else {
+            Button("\(action.rebuildVerb)…") { asking = action }
+                .accessibilityLabel("\(action.rebuildVerb) \(action.name)")
+        }
+    }
+
+    private func rebuildMessage(_ a: Candidate) -> String {
+        var text = a.rebuild.map { "Headroom runs “\($0)” in \(a.place)." }
+            ?? "Headroom runs its install or build command again in \(a.place)."
+        text += " It can take a few minutes and may download from the internet."
+        if let loss = a.dataLoss { text += " It can't bring back everything: \(loss)." }
+        return text
     }
 }
 
@@ -68,20 +97,25 @@ struct WouldHaveDoneView: View {
         let planned = model.actions.filter(\.dryRun)
         Group {
             if planned.isEmpty {
-                EmptyState(symbol: "list.bullet.clipboard", title: "Nothing to report yet",
-                           detail: "While dry run is on, what Headroom would have deleted shows up here.")
+                EmptyState(symbol: "eye", title: "Nothing to show yet",
+                           detail: "For its first 7 days Headroom only shows what it would delete. Its picks appear here.",
+                           action: nil)
             } else {
                 List {
                     Section {
                         ForEach(planned) { ActionRow(action: $0) { EmptyView() } }
                     } header: {
-                        Text("Would have freed \(bytes(planned.reduce(0) { $0 + $1.bytes })). "
-                            + (model.status.dryRun ? "Nothing has been deleted." : "Dry run is over."))
+                        Text("Would have freed \(bytes(planned.reduce(0) { $0 + $1.bytes })). Nothing was deleted.")
+                            .monospacedDigit()
+                    } footer: {
+                        if !model.status.dryRun {
+                            Text("The dry run is over. Headroom now frees space for real, and everything it deletes appears in History.")
+                        }
                     }
                 }
             }
         }
-        .navigationTitle("Would Have Done")
+        .navigationTitle("Dry Run")
     }
 }
 
@@ -90,15 +124,14 @@ struct ActionRow<Trailing: View>: View {
     @ViewBuilder let trailing: Trailing
 
     var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "folder").foregroundStyle(.secondary)
+        HStack(spacing: 12) {
             VStack(alignment: .leading, spacing: 2) {
                 Text(action.name)
-                Text("\(action.kind) · \(action.place)")
+                Text("\(action.what) · \(action.place)")
                     .font(.caption).foregroundStyle(.secondary)
                     .lineLimit(1).truncationMode(.middle)
             }
-            Spacer()
+            Spacer(minLength: 16)
             VStack(alignment: .trailing, spacing: 2) {
                 Text(bytes(action.bytes)).monospacedDigit()
                 if let date = action.date {
@@ -106,24 +139,29 @@ struct ActionRow<Trailing: View>: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
-            trailing
+            HStack(spacing: 4) { trailing }.frame(minWidth: 96, alignment: .trailing)
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, 4)
+        .opacity(action.undone ? 0.6 : 1)
+        .accessibilityElement(children: .contain)
         .help(action.reason ?? "")
     }
 }
 
 struct EmptyState: View {
     let symbol: String, title: String, detail: String
+    let action: (String, () -> Void)?
 
     var body: some View {
         VStack(spacing: 8) {
-            Image(systemName: symbol).font(.largeTitle).foregroundStyle(.tertiary)
-            Text(title).font(.headline)
-            Text(detail).foregroundStyle(.secondary).multilineTextAlignment(.center)
+            Image(systemName: symbol).font(.largeTitle).foregroundStyle(.secondary)
+            Text(title).font(.title3.weight(.semibold))
+            Text(detail).foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 360)
+            if let action { Button(action.0, action: action.1).padding(.top, 8) }
         }
         .padding(40)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(.background)
     }
 }
 
@@ -135,50 +173,73 @@ struct SettingsView: View {
         Form {
             if let binding = Binding($draft) {
                 Section {
-                    LabeledContent("Keep at least") {
-                        HStack(spacing: 4) {
-                            TextField("Budget", value: binding.budgetGB, format: .number)
+                    LabeledContent("Keep free") {
+                        HStack(spacing: 8) {
+                            TextField("Gigabytes", value: binding.budgetGB, format: .number)
                                 .labelsHidden().frame(width: 64).multilineTextAlignment(.trailing)
-                            Stepper("Budget", value: binding.budgetGB, in: 0...100_000, step: 5).labelsHidden()
-                            Text("GB free")
+                                .accessibilityLabel("Space to keep free, in gigabytes")
+                            Text("GB")
                         }
                     }
-                    Stepper(value: binding.recentDays, in: 1...365) {
-                        Text("Leave projects alone for \(binding.wrappedValue.recentDays) days after you open them")
+                    Picker("Leave projects alone for", selection: binding.recentDays) {
+                        ForEach([7, 14, 30, 60, 90], id: \.self) { Text("\($0) days").tag($0) }
+                        if ![7, 14, 30, 60, 90].contains(binding.wrappedValue.recentDays) {
+                            Text("\(binding.wrappedValue.recentDays) days").tag(binding.wrappedValue.recentDays)
+                        }
                     }
                 } header: {
-                    Text("Budget")
+                    Text("Free Space")
+                } footer: {
+                    Footnote(binding.wrappedValue.budgetBytes == 0
+                        ? "Headroom won't delete anything until you choose an amount."
+                        : "When free space drops below this, Headroom deletes the files you haven't used for longest, as long as it can rebuild them.")
                 }
                 Section {
-                    Toggle("Dry run: only show what Headroom would delete", isOn: binding.dryRun)
+                    Toggle("Only show what Headroom would delete", isOn: binding.dryRun)
                 } header: {
-                    Text("Safety")
+                    Text("Dry Run")
+                } footer: {
+                    Footnote("The dry run is on for your first 7 days. Its picks appear under Dry Run in the Headroom window.")
                 }
             } else {
-                Text("Loading settings…").foregroundStyle(.secondary)
+                ProgressView("Loading settings…")
             }
             Section {
-                Toggle("Launch at login", isOn: Binding(
+                Toggle("Open at login", isOn: Binding(
                     get: { model.launchAtLogin }, set: { model.setLaunchAtLogin($0) }
                 ))
                 if model.loginNeedsApproval {
-                    HStack {
-                        Text("Approve Headroom in Login Items to finish.").foregroundStyle(.secondary)
-                        Spacer()
-                        Button("Open Login Items") { SMAppService.openSystemSettingsLoginItems() }
+                    LabeledContent("Approve Headroom in Login Items to finish.") {
+                        Button("Open Login Items…") { SMAppService.openSystemSettingsLoginItems() }
                     }
                 }
                 LabeledContent("Full Disk Access") {
-                    Button("Open Privacy Settings") { openFullDiskAccessSettings() }
+                    Button(model.status.needsFullDiskAccess ? "Allow…" : "Review…") { openFullDiskAccessSettings() }
                 }
             } header: {
                 Text("General")
             }
         }
         .formStyle(.grouped)
-        .navigationTitle("Settings")
-        .onAppear { draft = model.settings }
+        .frame(width: 460)
+        .fixedSize(horizontal: false, vertical: true)
+        .onAppear {
+            model.loadSettings()
+            draft = model.settings
+        }
         .onReceive(model.$settings) { draft = $0 }
         .onChange(of: draft) { if let new = $0 { model.save(new) } }
+    }
+}
+
+/// A form footer that wraps instead of truncating and lines up with the section above it.
+struct Footnote: View {
+    let text: String
+    init(_ text: String) { self.text = text }
+
+    var body: some View {
+        Text(text).font(.callout).foregroundStyle(.secondary).multilineTextAlignment(.leading)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
