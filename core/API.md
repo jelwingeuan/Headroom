@@ -33,7 +33,10 @@ Cheap: one `statvfs` and a few small files, no scan. Call it as often as needed.
  "dry_run": true, "dry_run_days_left": 5,
  "next": {"path": "/Users/me/code/old/node_modules", "kind": "node_modules", "bytes": 412000000, "reason": "…"},
  "next_action": {"…": "same object as next"},
- "snapshot_holding": false, "permission_errors": 0, "last_tick": 1763251200}
+ "snapshot_holding": false, "permission_errors": 0, "last_tick": 1763251200,
+ "reclaimable_bytes": 38000000000, "protected_bytes": 21000000000,
+ "protected_by_reason": {"recent": 15000000000, "in_use": 2000000000, "history": 3000000000, "other": 1000000000},
+ "totals_at": 1763251200}
 ```
 
 - `budget_bytes` 0 means no budget chosen yet: autopilot does nothing.
@@ -42,6 +45,17 @@ Cheap: one `statvfs` and a few small files, no scan. Call it as often as needed.
 - `snapshot_holding`: a local Time Machine snapshot exists, so deleted bytes may not show up
   as free space until it expires.
 - `permission_errors`: folders the last scan couldn't read (Full Disk Access is missing).
+- `reclaimable_bytes`: what autopilot could still reclaim under the saved settings (eligible,
+  cold, not busy), after that tick's own deletes, in private bytes. Docker is left out (its
+  space stays inside its VM disk).
+- `protected_bytes`: what the same scan found and kept (recent, in use, conversation history,
+  tracked, the newest simulator…), in private bytes, nothing counted twice. Kept folders are
+  only sized during ticks, never by `scan`, so this costs nothing at status time.
+- `protected_by_reason`: `protected_bytes` split into `recent`, `in_use`, `history`, `other`.
+- `totals_at`: when that scan ran. All four are `null` until a tick has scanned. A tick
+  under budget pressure always scans (dry run included); any other tick, with plenty of space
+  or no budget chosen, makes one read-only scan when the saved totals are missing or 24 hours
+  old, and deletes nothing. So the totals are at most a day old while ticks run.
 
 ### `history`
 ```json

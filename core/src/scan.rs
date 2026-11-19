@@ -314,12 +314,22 @@ struct Sized {
     newest: Option<(i64, PathBuf)>,
 }
 
-/// Private allocated bytes of every candidate (hard links counted only when all their links
-/// are inside), plus the newest file of each node_modules for the hand-edit check.
+/// Private allocated bytes of every candidate that may go (hard links counted only when all
+/// their links are inside), plus the newest file of each node_modules for the hand-edit check.
 fn size_all(cands: &mut [Cand]) {
+    size_where(cands, |c| c.blocked.is_none());
+}
+
+/// Sizes the candidates a scan kept (it leaves them at 0 for speed). Autopilot ticks call it
+/// for the "protected" total; plain scans never do.
+pub fn size_kept(cands: &mut [Cand]) {
+    size_where(cands, |c| c.blocked.is_some() && c.bytes == 0);
+}
+
+fn size_where(cands: &mut [Cand], pick: impl Fn(&Cand) -> bool) {
     let mut tasks = vec![];
     for (i, c) in cands.iter_mut().enumerate() {
-        if c.sized || c.blocked.is_some() {
+        if c.sized || !pick(c) {
             continue;
         }
         match &c.how {
@@ -761,8 +771,32 @@ pub struct Scan {
     pub denied: usize,
 }
 
+thread_local! {
+    /// Scans started on this thread (tests check that `status` starts none).
+    pub static SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Why a kept candidate was kept, in a few stable words for the status totals.
+pub fn kept_key(reason: &str) -> &'static str {
+    if reason.starts_with("used ") {
+        "recent"
+    } else if reason.starts_with("in use")
+        || reason.ends_with(" is running")
+        || reason.contains(" simulator is ")
+        || reason.starts_with("Xcode is building")
+        || reason.contains("may be in use")
+    {
+        "in_use"
+    } else if reason.contains("conversation history") {
+        "history"
+    } else {
+        "other"
+    }
+}
+
 /// Everything under `root` plus the machine-wide places, judged, largest first.
 pub fn scan(ctx: &Ctx, root: &Path) -> Result<Scan, String> {
+    SCANS.with(|n| n.set(n.get() + 1));
     let root = root.canonicalize().map_err(|e| format!("{}: {e}", root.display()))?;
     refuse(ctx, &root)?;
     let ((mut cands, denied), cwds) = std::thread::scope(|s| {

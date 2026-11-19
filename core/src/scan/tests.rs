@@ -58,6 +58,7 @@ fn a_recent_commit_or_an_open_editor_keeps_the_project() {
     write(&storage, &format!(r#"{{"windowsState":{{"lastActiveWindow":{{"folder":"{uri}"}}}}}}"#));
     let s = scan(&ctx, &w).unwrap();
     assert!(blocked(&s, &fresh.join("node_modules")).contains("used 2 days ago"));
+    assert_eq!(find(&s, &fresh.join("node_modules")).bytes, 0, "a plain scan never walks what it keeps");
     assert!(blocked(&s, &open.join("node_modules")).contains("days ago"));
     // The editor's record ages like everything else.
     touch(&storage, ctx.now - 30 * DAY);

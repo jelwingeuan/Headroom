@@ -33,10 +33,23 @@ pub fn tick(ctx: &Ctx, budget: u64, emit: &mut dyn FnMut(Json)) -> bool {
     st.set("last_tick", ctx.now);
     if budget == 0 || free >= budget {
         st.set("next", Json::Null);
+        // No pressure: nothing is deleted, but the menu's totals are refreshed once a day.
+        let stale = st.get("totals").and_then(|t| t.get("at")).and_then(Json::u64).map_or(true, |t| t + DAY <= ctx.now);
+        if stale {
+            match scan::scan(ctx, &ctx.home) {
+                Ok(mut s) => {
+                    st.set("permission_errors", s.denied);
+                    scan::size_kept(&mut s.cands);
+                    let reclaimable = s.cands.iter().filter(|c| c.reclaimable() && c.frees_host).map(|c| c.bytes).sum();
+                    st.set("totals", totals(&kept_bytes(&s.cands), reclaimable, ctx.now));
+                }
+                Err(e) => emit(obj! {"event" => "error", "error" => e}),
+            }
+        }
         state::locked(ctx, || state::save_state(ctx, &with_created(ctx, st)));
         return true;
     }
-    let s = match scan::scan(ctx, &ctx.home) {
+    let mut s = match scan::scan(ctx, &ctx.home) {
         Ok(s) => s,
         Err(e) => {
             emit(obj! {"event" => "error", "error" => e});
@@ -51,6 +64,8 @@ pub fn tick(ctx: &Ctx, budget: u64, emit: &mut dyn FnMut(Json)) -> bool {
         .collect();
     state::observe(ctx, &busy);
     st.set("permission_errors", s.denied);
+    scan::size_kept(&mut s.cands);
+    let protected = kept_bytes(&s.cands);
     let groups = shrink::duplicate_groups(&s.cands);
     let mut pool: Vec<Cand> = s.cands.into_iter().filter(|c| c.reclaimable() && c.frees_host).collect();
     pool.sort_by_key(|c| (c.active.unwrap_or(0), std::cmp::Reverse(c.bytes)));
@@ -66,6 +81,7 @@ pub fn tick(ctx: &Ctx, budget: u64, emit: &mut dyn FnMut(Json)) -> bool {
 
     let mut i = 0;
     let mut failed = 0u64;
+    let mut freed_paths: Vec<std::path::PathBuf> = vec![];
     while free < budget && i < pool.len() {
         let need = budget - free;
         let mut got = 0u64;
@@ -89,6 +105,7 @@ pub fn tick(ctx: &Ctx, budget: u64, emit: &mut dyn FnMut(Json)) -> bool {
                         obj! {"event" => "reclaim", "id" => a.s("id"), "path" => &c.path, "kind" => &c.kind, "bytes" => bytes},
                     );
                     got += bytes;
+                    freed_paths.push(c.path.clone());
                 }
                 Err(e) => {
                     failed += c.bytes;
@@ -112,9 +129,44 @@ pub fn tick(ctx: &Ctx, budget: u64, emit: &mut dyn FnMut(Json)) -> bool {
     }
     let next = pool.get(i).map(|c| obj! {"path" => &c.path, "kind" => &c.kind, "bytes" => c.bytes, "reason" => &c.why});
     st.set("next", next);
+    // For the menu: what could still come back, and what is kept and why.
+    let still: u64 = pool.iter().filter(|c| !freed_paths.contains(&c.path)).map(|c| c.bytes).sum();
+    st.set("totals", totals(&protected, still, ctx.now));
     st.set("snapshot_holding", crate::machine::snapshot_holding());
     state::locked(ctx, || state::save_state(ctx, &with_created(ctx, st)));
     true
+}
+
+/// Bytes of every kept candidate by reason, nothing counted twice: a folder inside another
+/// candidate is skipped, and a kept folder holding ones that may go (a worktree with its
+/// node_modules) counts only the rest.
+fn kept_bytes(cands: &[Cand]) -> Vec<(&'static str, u64)> {
+    let mut out = vec![];
+    for k in cands.iter().filter(|c| c.blocked.is_some() && c.frees_host) {
+        let reason = k.reason();
+        let nested = cands.iter().any(|o| o.path != k.path && k.path.starts_with(&o.path) && o.frees_host);
+        if reason == "goes with its worktree" || nested {
+            continue;
+        }
+        let inner: u64 = cands
+            .iter()
+            .filter(|o| o.reclaimable() && o.path != k.path && o.path.starts_with(&k.path))
+            .map(|o| o.bytes)
+            .sum();
+        out.push((scan::kept_key(reason), k.bytes.saturating_sub(inner)));
+    }
+    out
+}
+
+/// The totals `status` reports, as kept in state.
+fn totals(protected: &[(&'static str, u64)], reclaimable: u64, at: u64) -> Json {
+    let mut by = obj! {"recent" => 0u64, "in_use" => 0u64, "history" => 0u64, "other" => 0u64};
+    for (key, b) in protected {
+        let now = by.get(key).and_then(Json::u64).unwrap_or(0);
+        by.set(key, now + b);
+    }
+    obj! {"reclaimable_bytes" => reclaimable, "protected_bytes" => protected.iter().map(|(_, b)| b).sum::<u64>(),
+    "protected_by_reason" => by, "at" => at}
 }
 
 /// Keeps `created` (and anything else another process wrote meanwhile) when saving.
@@ -160,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn no_pressure_no_scan_no_deletes() {
+    fn no_pressure_no_deletes() {
         let ctx = ctx("ap-calm");
         let p = project(&ctx, "a", 1_500_000_000);
         let ev = run(&ctx, 1);

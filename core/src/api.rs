@@ -30,12 +30,17 @@ fn status(ctx: &Ctx) -> Json {
     let s = state::settings(ctx);
     let (dry, left) = state::dry_run(ctx);
     let st = state::load_state(ctx);
+    let totals = st.get("totals");
     obj! {
         "free_bytes" => sys::free_bytes(&ctx.home), "budget_bytes" => s.budget_bytes,
         "recent_days" => s.recent_days, "dry_run" => dry, "dry_run_days_left" => left,
         "next" => st.get("next").cloned(), "next_action" => st.get("next").cloned(), "snapshot_holding" => st.get("snapshot_holding").and_then(Json::bool).unwrap_or(false),
         "permission_errors" => st.get("permission_errors").and_then(Json::u64).unwrap_or(0),
         "last_tick" => st.get("last_tick").cloned(),
+        "reclaimable_bytes" => totals.and_then(|t| t.get("reclaimable_bytes")).cloned(),
+        "protected_bytes" => totals.and_then(|t| t.get("protected_bytes")).cloned(),
+        "protected_by_reason" => totals.and_then(|t| t.get("protected_by_reason")).cloned(),
+        "totals_at" => totals.and_then(|t| t.get("at")).cloned(),
     }
 }
 
@@ -183,6 +188,90 @@ fn digest(ctx: &Ctx) -> Json {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_reports_the_last_ticks_totals_and_never_scans() {
+        use crate::testutil::{git, touch, write};
+        let mut ctx = crate::testutil::ctx("api-totals");
+        let mk = |name: &str, when: u64| {
+            let p = ctx.home.join("code").join(name);
+            write(&p.join("package.json"), "{}");
+            write(&p.join("package-lock.json"), "{}");
+            write(&p.join(".gitignore"), "node_modules/\n");
+            git(&p, &["init", "-q"], Some(when));
+            git(&p, &["add", "-A"], Some(when));
+            git(&p, &["commit", "-qm", "c"], Some(when));
+            std::fs::create_dir_all(p.join("node_modules/x")).unwrap();
+            std::fs::write(p.join("node_modules/x/blob.js"), vec![1u8; 1 << 20]).unwrap();
+            write(&p.join("node_modules/.package-lock.json"), "{}");
+            touch(&p.join("node_modules/x/blob.js"), when);
+            p
+        };
+        mk("cold", 1_600_000_000);
+        mk("recent", ctx.now - DAY);
+        write(&ctx.home.join(".claude/projects/x/a.jsonl"), &"history\n".repeat(1000));
+        ctx.machine = true;
+        let before = crate::scan::SCANS.with(|n| n.get());
+        let s = status(&ctx);
+        for k in ["reclaimable_bytes", "protected_bytes", "protected_by_reason", "totals_at"] {
+            assert_eq!(s.get(k), Some(&Json::Null), "{k} before any tick");
+        }
+        // A dry-run tick under pressure scans (and deletes nothing).
+        crate::autopilot::tick(&ctx, sys::free_bytes(&ctx.home) + (1 << 40), &mut |_| {});
+        assert!(ctx.home.join("code/cold/node_modules/x/blob.js").exists());
+        let mid = crate::scan::SCANS.with(|n| n.get());
+        assert_eq!(mid, before + 1);
+        let s = status(&ctx);
+        assert_eq!(crate::scan::SCANS.with(|n| n.get()), mid, "status never scans");
+        let bytes = |k: &str| s.get(k).and_then(Json::u64).unwrap();
+        assert!(bytes("reclaimable_bytes") >= 1 << 20, "{s}");
+        assert!(bytes("protected_bytes") >= (1 << 20) + 8000, "{s}");
+        let by = s.get("protected_by_reason").unwrap();
+        assert!(by.get("recent").and_then(Json::u64).unwrap() >= 1 << 20, "{s}");
+        assert!(by.get("history").and_then(Json::u64).unwrap() >= 8000, "{s}");
+        assert_eq!(s.get("totals_at").and_then(Json::u64), Some(ctx.now));
+    }
+
+    #[test]
+    fn totals_come_daily_even_with_plenty_of_space_and_no_budget() {
+        use crate::testutil::{git, touch, write};
+        let mut ctx = crate::testutil::ctx("api-totals-calm");
+        ctx.machine = true; // AI history is a machine-wide place
+        let p = ctx.home.join("code/cold");
+        write(&p.join("package.json"), "{}");
+        write(&p.join("package-lock.json"), "{}");
+        write(&p.join(".gitignore"), "node_modules/\n");
+        git(&p, &["init", "-q"], Some(1_600_000_000));
+        git(&p, &["add", "-A"], Some(1_600_000_000));
+        git(&p, &["commit", "-qm", "c"], Some(1_600_000_000));
+        std::fs::create_dir_all(p.join("node_modules/x")).unwrap();
+        std::fs::write(p.join("node_modules/x/blob.js"), vec![1u8; 1 << 20]).unwrap();
+        write(&p.join("node_modules/.package-lock.json"), "{}");
+        touch(&p.join("node_modules/x/blob.js"), 1_600_000_000);
+        write(&ctx.home.join(".claude/projects/x/a.jsonl"), &"history\n".repeat(1000));
+        let scans = || crate::scan::SCANS.with(|n| n.get());
+        for budget in [0, 1] {
+            // budget 0 (none chosen) and a budget far below free space: no pressure either way.
+            let mut c = ctx.clone();
+            c.state = ctx.state.join(format!("b{budget}"));
+            let before = scans();
+            crate::autopilot::tick(&c, budget, &mut |_| {});
+            assert_eq!(scans(), before + 1, "no saved totals: one read-only scan");
+            assert!(p.join("node_modules/x/blob.js").exists(), "nothing deleted");
+            let s = status(&c);
+            assert!(s.get("reclaimable_bytes").and_then(Json::u64).unwrap() >= 1 << 20, "{s}");
+            assert!(s.get("protected_bytes").and_then(Json::u64).unwrap() >= 8000, "{s}");
+            assert_eq!(s.get("totals_at").and_then(Json::u64), Some(c.now));
+            // Within 24 h: no new scan.
+            c.now += 23 * 3600;
+            crate::autopilot::tick(&c, budget, &mut |_| {});
+            assert_eq!(scans(), before + 1, "fresh totals are not rescanned");
+            // A day later they are refreshed.
+            c.now += 3600;
+            crate::autopilot::tick(&c, budget, &mut |_| {});
+            assert_eq!(scans(), before + 2);
+        }
+    }
 
     #[test]
     fn settings_round_trip_keeps_the_automatic_dry_run() {
