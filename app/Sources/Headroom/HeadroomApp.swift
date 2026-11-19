@@ -7,8 +7,7 @@ struct HeadroomApp: App {
         MenuBarExtra {
             MenuView().environmentObject(model)
         } label: {
-            Image(systemName: menuSymbol)
-                .accessibilityLabel("Headroom")
+            MenuBarIcon(status: model.status, paused: model.paused)
         }
         .menuBarExtraStyle(.window)
 
@@ -17,11 +16,19 @@ struct HeadroomApp: App {
         }
         .defaultSize(width: 720, height: 480)
     }
+}
 
-    private var menuSymbol: String {
-        if model.paused { return "pause.circle" }
-        let s = model.status
-        if let free = s.freeBytes, let budget = s.budgetBytes, budget > 0, free < budget { return "gauge.low" }
+struct MenuBarIcon: View {
+    let status: Status
+    let paused: Bool
+
+    var body: some View {
+        Image(systemName: symbol).accessibilityLabel("Headroom")
+    }
+
+    private var symbol: String {
+        if paused { return "pause.circle" }
+        if let free = status.freeBytes, let budget = status.budgetBytes, budget > 0, free < budget { return "gauge.low" }
         return "gauge.medium"
     }
 }
