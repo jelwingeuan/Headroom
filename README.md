@@ -2,16 +2,30 @@
 
 # Headroom
 
+[![CI](https://github.com/jelwingeuan/Headroom/actions/workflows/ci.yml/badge.svg)](https://github.com/jelwingeuan/Headroom/actions/workflows/ci.yml)
+[![Judge](https://github.com/jelwingeuan/Headroom/actions/workflows/judge.yml/badge.svg)](https://github.com/jelwingeuan/Headroom/actions/workflows/judge.yml)
+
 Your Mac never drops below the free space you chose, and you never lose work getting there.
 
 Headroom is a free, open-source menu-bar app for macOS 13+ (Apple silicon and Intel). You set a
 budget, like "keep 60 GB free". When free space nears it, Headroom reclaims the coldest
-**rebuildable** bytes first: dependencies and build output of projects you haven't touched,
-old AI-tool versions, Xcode leftovers, unused Docker images and local AI models, and merged
-agent worktrees. It never touches anything it can't rebuild, anything you opened recently, or
-anything whose dev server or build is running.
+**rebuildable** bytes first:
+- dependencies and build output of projects you haven't touched
+- Xcode leftovers
+- old AI-tool versions, and the caches of AI desktop apps while they're closed
+- unused Docker images and local AI models
+- merged agent worktrees
 
-No account, no telemetry, no network. MIT licensed.
+Before deleting, it shrinks: identical files across copies of the same `node_modules` become
+APFS clones, so they take space only once.
+
+It never touches anything you opened recently, or anything whose dev server or build is
+running. The one thing it deletes that can't be rebuilt is an iOS simulator you haven't used in
+30 days: its test apps and data go, and Undo gives you a blank device of the same kind. Headroom
+always keeps the simulator you used most recently of each type.
+
+No account, no telemetry. Headroom itself never connects to the network; Undo runs your own
+package managers (npm, cargo, pip), which download what they need. MIT licensed.
 
 > **Status:** in development. Nothing is released yet. The outside judge in `judge/` was written
 > before the features, and every change is scored against it.
