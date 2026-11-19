@@ -4,14 +4,12 @@ import UserNotifications
 
 enum Pane: String, CaseIterable, Identifiable {
     case history = "History"
-    case wouldHaveDone = "Would Have Done"
-    case settings = "Settings"
+    case wouldHaveDone = "Dry Run"
     var id: Self { self }
     var symbol: String {
         switch self {
         case .history: "clock.arrow.circlepath"
-        case .wouldHaveDone: "list.bullet.clipboard"
-        case .settings: "gearshape"
+        case .wouldHaveDone: "eye"
         }
     }
 }
