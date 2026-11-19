@@ -27,6 +27,18 @@ struct HeadroomApp: App {
 enum Mood {
     case unknown, noBudget, paused, plenty, dryRun, acting, stuck, failed
 
+    /// One glyph per state, shared by the menu bar icon and the menu's verdict line.
+    var symbol: String {
+        switch self {
+        case .unknown, .noBudget: "gauge.with.dots.needle.bottom.0percent"
+        case .paused: "pause.circle"
+        case .plenty: "checkmark.circle"
+        case .dryRun: "eye.circle"
+        case .acting: "arrow.triangle.2.circlepath.circle"
+        case .stuck, .failed: "exclamationmark.circle"
+        }
+    }
+
     init(_ s: Status, paused: Bool) {
         if s.error != nil { self = .failed; return }
         guard let free = s.freeBytes, let budget = s.budgetBytes else { self = .unknown; return }
@@ -45,21 +57,11 @@ struct MenuBarIcon: View {
 
     var body: some View {
         let mood = Mood(status, paused: paused)
-        Image(systemName: symbol(mood))
+        Image(systemName: mood.symbol)
             .accessibilityLabel("Headroom")
             .accessibilityValue(label(mood))
     }
 
-    private func symbol(_ m: Mood) -> String {
-        switch m {
-        case .unknown, .noBudget: "gauge.with.dots.needle.bottom.0percent"
-        case .paused: "pause.circle"
-        case .plenty: "gauge.with.dots.needle.67percent"
-        case .dryRun: "eye.circle"
-        case .acting: "arrow.triangle.2.circlepath.circle"
-        case .stuck, .failed: "exclamationmark.circle"
-        }
-    }
 
     private func label(_ m: Mood) -> String {
         switch m {
@@ -82,20 +84,27 @@ struct SpaceBar: View {
     let free: Int64
     let budget: Int64
     let canComeBack: Int64?
+    /// Bytes Headroom is freeing right now (only while acting); drawn in Headroom's teal.
+    var freeing: Int64 = 0
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        let top = Double(max(free + (canComeBack ?? 0), budget)) * 1.1
+        // The track ends at the larger of the budget and what free space could reach: no padding.
+        let top = Double(max(free + (canComeBack ?? 0), budget))
         let f = Double(free) / top, b = Double(budget) / top
-        let back = Double(canComeBack ?? 0) / top
-        let freeColor = free >= budget ? Color.primary.opacity(0.7) : Color.orange
+        let now = Double(min(freeing, canComeBack ?? 0)) / top
+        let back = Double(canComeBack ?? 0) / top - now
+        // Free is always the same color; teal appears only on what Headroom is freeing right now.
+        let freeColor = Color.primary.opacity(0.7)
+        let backColor = Color.secondary.opacity(0.45)
         VStack(alignment: .leading, spacing: 6) {
             GeometryReader { geo in
                 let w = geo.size.width
                 // Segments sit apart by a 2 pt gap, so they read as separate without relying on hue.
                 HStack(spacing: 2) {
                     Rectangle().fill(freeColor).frame(width: max(w * f - 1, 2))
-                    if back > 0 { Rectangle().fill(Color.secondary.opacity(0.45)).frame(width: max(w * back - 1, 2)) }
+                    if now > 0 { Rectangle().fill(Color.headroom).frame(width: max(w * now - 1, 2)) }
+                    if back > 0 { Rectangle().fill(backColor).frame(width: max(w * back - 1, 2)) }
                     Rectangle().fill(.quaternary)
                 }
                 .clipShape(Capsule())
@@ -108,11 +117,15 @@ struct SpaceBar: View {
             }
             .frame(height: 10)
             .padding(.vertical, 4)
-            HStack(spacing: 12) {
+            let swatches = HStack(spacing: 12) {
                 Swatch(color: freeColor, text: "Free")
-                if back > 0 { Swatch(color: Color.secondary.opacity(0.45), text: "Can be freed") }
-                Spacer()
-                Label("\(bytes(budget)) budget", systemImage: "line.diagonal").labelStyle(BudgetLabelStyle())
+                if now > 0 { Swatch(color: .headroom, text: "Freeing now") }
+                if back > 0 { Swatch(color: backColor, text: "Can be freed") }
+            }
+            let budgetLabel = Label("\(bytes(budget)) budget", systemImage: "line.diagonal").labelStyle(BudgetLabelStyle())
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 12) { swatches; Spacer(minLength: 0); budgetLabel }
+                VStack(alignment: .leading, spacing: 4) { swatches; budgetLabel }
             }
             .font(.subheadline)
         }
@@ -132,7 +145,7 @@ struct Swatch: View {
     var body: some View {
         HStack(spacing: 4) {
             RoundedRectangle(cornerRadius: 2).fill(color).frame(width: 10, height: 10)
-            Text(text).foregroundStyle(.secondary)
+            Text(text).foregroundStyle(.secondary).fixedSize()
         }
     }
 }
@@ -169,7 +182,8 @@ struct MenuView: View {
             }
 
             if let free = s.freeBytes, let budget = s.budgetBytes, budget > 0 {
-                SpaceBar(free: free, budget: budget, canComeBack: s.canComeBack)
+                SpaceBar(free: free, budget: budget, canComeBack: s.canComeBack,
+                         freeing: mood == .acting ? s.next?.bytes ?? 0 : 0)
             }
 
             verdict(s, mood)
@@ -192,7 +206,7 @@ struct MenuView: View {
             VStack(spacing: 0) {
                 MenuRow("Open Headroom", shortcut: "o") { open(.history) }
                 MenuRow("Settings…", shortcut: ",") { openSettings() }
-                MenuRow(model.paused ? "Resume Autopilot" : "Pause Autopilot",
+                MenuRow(model.paused ? "Resume Headroom" : "Pause Headroom",
                         disabled: mood == .noBudget || mood == .failed) { model.paused.toggle() }
                 Divider().padding(.vertical, 4)
                 MenuRow("Quit Headroom", shortcut: "q") { NSApp.terminate(nil) }
@@ -200,6 +214,7 @@ struct MenuView: View {
         }
         .padding(16)
         .frame(width: 320)
+        .tint(.headroom)
         .onAppear {
             model.refresh()
             model.loadHistory()
@@ -214,7 +229,7 @@ struct MenuView: View {
         if let back = s.canComeBack, back > 0 { parts.append("\(bytes(back)) can be freed") }
         switch mood {
         case .plenty: parts.append("nothing to do")
-        case .dryRun: parts.append("dry run, nothing deleted")
+        case .dryRun: parts.append("nothing will be deleted yet")
         case .acting: parts.append("freeing space")
         case .paused: parts.append("paused")
         default: break
@@ -226,29 +241,29 @@ struct MenuView: View {
         let gap = (s.budgetBytes ?? 0) - (s.freeBytes ?? 0)
         switch mood {
         case .failed:
-            Notice(symbol: "exclamationmark.triangle",
+            Notice(symbol: mood.symbol,
                    text: "Headroom couldn't read your disk. Nothing will be deleted until it can. If Try Again doesn't help, quit and reopen Headroom.",
                    action: ("Try Again", { model.refresh() }), prominent: true)
         case .noBudget:
-            Notice(symbol: "gauge.with.dots.needle.bottom.0percent",
+            Notice(symbol: mood.symbol,
                    text: "Choose how much space to keep free. Headroom won't delete anything until you do.",
                    action: ("Set a Budget…", openSettings), prominent: true)
         case .paused:
-            Notice(symbol: "pause.circle", text: "Paused. Nothing will be deleted until you resume.")
+            Notice(symbol: mood.symbol, text: "Paused. Nothing will be deleted until you resume.")
         case .plenty:
-            Notice(symbol: "checkmark.circle", text: "\(bytes(-gap)) above your budget. Nothing to do.")
+            Notice(symbol: mood.symbol, text: "\(bytes(-gap)) above your budget. Nothing to do.")
         case .dryRun:
             let days = s.dryRunDaysLeft ?? 0
-            Notice(symbol: "eye", text: "\(bytes(gap)) below your budget. This is a dry run, so nothing is deleted"
+            Notice(symbol: mood.symbol, text: "\(bytes(gap)) below your budget. This is a dry run, so nothing is deleted"
                 + (days > 0 ? " for \(days) more \(days == 1 ? "day" : "days")." : "."))
         case .acting:
             if let next = s.next {
-                Notice(symbol: "arrow.triangle.2.circlepath",
+                Notice(symbol: mood.symbol,
                        text: "\(bytes(gap)) below your budget. Freeing \(bytes(next.bytes)) of \(next.what) in \(next.name).",
                        busy: true)
             }
         case .stuck:
-            Notice(symbol: "exclamationmark.triangle",
+            Notice(symbol: mood.symbol,
                    text: "\(bytes(gap)) below your budget, and nothing left is safe to delete. Free some space yourself.")
         case .unknown:
             EmptyView()
@@ -260,6 +275,16 @@ struct MenuView: View {
         openWindow(id: "main")
         NSApp.activate(ignoringOtherApps: true)
     }
+}
+
+extension Color {
+    /// Headroom's teal (#0F6E5C), lifted in dark mode so it keeps its contrast. Used only where
+    /// it means "Headroom is acting or acted".
+    static let headroom = Color(nsColor: NSColor(name: nil) { look in
+        look.bestMatch(from: [.darkAqua, .accessibilityHighContrastDarkAqua]) == nil
+            ? NSColor(srgbRed: 0.059, green: 0.431, blue: 0.361, alpha: 1)
+            : NSColor(srgbRed: 0.247, green: 0.702, blue: 0.604, alpha: 1)
+    })
 }
 
 /// Opens the Settings scene (⌘,); macOS 13 has no SwiftUI call for it from a menu bar extra.
@@ -357,7 +382,6 @@ struct MenuRow: View {
         }
         .buttonStyle(.plain)
         .disabled(disabled)
-        .opacity(disabled ? 0.4 : 1)
         .onHover { hover = $0 }
         .commandShortcut(shortcut)
         .padding(.horizontal, -8)
