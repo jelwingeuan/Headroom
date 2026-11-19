@@ -55,9 +55,9 @@ struct MenuBarIcon: View {
         case .unknown, .noBudget: "gauge.with.dots.needle.bottom.0percent"
         case .paused: "pause.circle"
         case .plenty: "gauge.with.dots.needle.67percent"
-        case .dryRun: "gauge.with.dots.needle.33percent"
+        case .dryRun: "eye.circle"
         case .acting: "arrow.triangle.2.circlepath.circle"
-        case .stuck, .failed: "exclamationmark.triangle"
+        case .stuck, .failed: "exclamationmark.circle"
         }
     }
 
@@ -88,37 +88,62 @@ struct SpaceBar: View {
         let top = Double(max(free + (canComeBack ?? 0), budget)) * 1.1
         let f = Double(free) / top, b = Double(budget) / top
         let back = Double(canComeBack ?? 0) / top
-        VStack(alignment: .leading, spacing: 4) {
+        let freeColor = free >= budget ? Color.primary.opacity(0.7) : Color.orange
+        VStack(alignment: .leading, spacing: 6) {
             GeometryReader { geo in
                 let w = geo.size.width
-                ZStack(alignment: .leading) {
-                    Capsule().fill(.quaternary)
-                    Rectangle().fill(.tertiary)
-                        .frame(width: w * min(f + back, 1))
-                    Rectangle().fill(free >= budget ? Color.primary.opacity(0.55) : Color.orange)
-                        .frame(width: w * f)
+                // Segments sit apart by a 2 pt gap, so they read as separate without relying on hue.
+                HStack(spacing: 2) {
+                    Rectangle().fill(freeColor).frame(width: max(w * f - 1, 2))
+                    if back > 0 { Rectangle().fill(Color.secondary.opacity(0.45)).frame(width: max(w * back - 1, 2)) }
+                    Rectangle().fill(.quaternary)
                 }
                 .clipShape(Capsule())
                 .overlay(alignment: .leading) {
-                    Rectangle().fill(.primary).frame(width: 2, height: 16).offset(x: w * b - 1)
+                    // The budget line: label color with a ring of the background, legible on any segment.
+                    Rectangle().fill(.primary).frame(width: 2, height: 18)
+                        .background(Rectangle().fill(.background).frame(width: 4, height: 20))
+                        .offset(x: w * b - 1)
                 }
             }
-            .frame(height: 8)
+            .frame(height: 10)
             .padding(.vertical, 4)
-            GeometryReader { geo in
-                Text("\(bytes(budget)) budget")
-                    .font(.caption).foregroundStyle(.secondary).monospacedDigit()
-                    .fixedSize()
-                    .position(x: min(max(geo.size.width * b, 40), geo.size.width - 40), y: 6)
+            HStack(spacing: 12) {
+                Swatch(color: freeColor, text: "Free")
+                if back > 0 { Swatch(color: Color.secondary.opacity(0.45), text: "Can be freed") }
+                Spacer()
+                Label("\(bytes(budget)) budget", systemImage: "line.diagonal").labelStyle(BudgetLabelStyle())
             }
-            .frame(height: 12)
+            .font(.subheadline)
         }
         .animation(reduceMotion ? .easeInOut(duration: 0.2) : .spring(response: 0.4, dampingFraction: 1),
                    value: free)
         .accessibilityElement()
-        .accessibilityLabel("Free space")
+        .accessibilityLabel("Free space chart")
         .accessibilityValue("\(bytes(free)) free, budget \(bytes(budget))"
-            + (canComeBack.map { ", \(bytes($0)) can come back" } ?? ""))
+            + (canComeBack.map { ", \(bytes($0)) more can be freed" } ?? ""))
+    }
+}
+
+struct Swatch: View {
+    let color: Color
+    let text: String
+
+    var body: some View {
+        HStack(spacing: 4) {
+            RoundedRectangle(cornerRadius: 2).fill(color).frame(width: 10, height: 10)
+            Text(text).foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// "| 60 GB budget": a short vertical tick like the one on the chart, then the label.
+struct BudgetLabelStyle: LabelStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(spacing: 4) {
+            Rectangle().fill(.primary).frame(width: 2, height: 10)
+            configuration.title.foregroundStyle(.secondary).monospacedDigit()
+        }
     }
 }
 
@@ -133,11 +158,14 @@ struct MenuView: View {
             VStack(alignment: .leading, spacing: 4) {
                 if let free = s.freeBytes {
                     Text("\(bytes(free)) free").font(.title2.weight(.semibold)).monospacedDigit()
-                } else if mood == .unknown {
-                    Text("Measuring free space…").font(.title2.weight(.semibold)).foregroundStyle(.secondary)
+                } else {
+                    Text(mood == .failed ? "Free space unknown" : "Measuring free space…")
+                        .font(.title2.weight(.semibold))
                 }
-                Text(summary(s, mood)).font(.callout).foregroundStyle(.secondary).monospacedDigit()
-                    .fixedSize(horizontal: false, vertical: true)
+                let line = summary(s, mood)
+                if !line.isEmpty {
+                    Text(line).font(.callout).monospacedDigit().fixedSize(horizontal: false, vertical: true)
+                }
             }
 
             if let free = s.freeBytes, let budget = s.budgetBytes, budget > 0 {
@@ -183,7 +211,7 @@ struct MenuView: View {
     /// The status line: free space, what can come back, and what Headroom will do.
     private func summary(_ s: Status, _ mood: Mood) -> String {
         var parts: [String] = []
-        if let back = s.canComeBack, back > 0 { parts.append("\(bytes(back)) can come back") }
+        if let back = s.canComeBack, back > 0 { parts.append("\(bytes(back)) can be freed") }
         switch mood {
         case .plenty: parts.append("nothing to do")
         case .dryRun: parts.append("dry run, nothing deleted")
@@ -199,12 +227,12 @@ struct MenuView: View {
         switch mood {
         case .failed:
             Notice(symbol: "exclamationmark.triangle",
-                   text: "Headroom can't check your disk right now. Nothing will be deleted until it can.",
-                   action: ("Try Again", { model.refresh() }))
+                   text: "Headroom couldn't read your disk. Nothing will be deleted until it can. If Try Again doesn't help, quit and reopen Headroom.",
+                   action: ("Try Again", { model.refresh() }), prominent: true)
         case .noBudget:
             Notice(symbol: "gauge.with.dots.needle.bottom.0percent",
                    text: "Choose how much space to keep free. Headroom won't delete anything until you do.",
-                   action: ("Set a Budget…", openSettings))
+                   action: ("Set a Budget…", openSettings), prominent: true)
         case .paused:
             Notice(symbol: "pause.circle", text: "Paused. Nothing will be deleted until you resume.")
         case .plenty:
@@ -216,7 +244,8 @@ struct MenuView: View {
         case .acting:
             if let next = s.next {
                 Notice(symbol: "arrow.triangle.2.circlepath",
-                       text: "\(bytes(gap)) below your budget. Next: \(next.what) in \(next.name), \(bytes(next.bytes)).")
+                       text: "\(bytes(gap)) below your budget. Freeing \(bytes(next.bytes)) of \(next.what) in \(next.name).",
+                       busy: true)
             }
         case .stuck:
             Notice(symbol: "exclamationmark.triangle",
@@ -244,18 +273,28 @@ struct Notice: View {
     let symbol: String
     let text: String
     var action: (String, () -> Void)?
+    var prominent = false
+    var busy = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label {
-                Text(text).fixedSize(horizontal: false, vertical: true)
-            } icon: {
-                Image(systemName: symbol).foregroundStyle(.secondary)
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Group {
+                if busy { ProgressView().controlSize(.small) } else { Image(systemName: symbol) }
             }
-            if let action {
-                Button(action.0, action: action.1).padding(.leading, 28)
+            .foregroundStyle(.secondary)
+            .frame(width: 20)
+            VStack(alignment: .leading, spacing: 8) {
+                Text(text).fixedSize(horizontal: false, vertical: true)
+                if let action {
+                    if prominent {
+                        Button(action.0, action: action.1).buttonStyle(.borderedProminent)
+                    } else {
+                        Button(action.0, action: action.1)
+                    }
+                }
             }
         }
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -267,7 +306,7 @@ struct WouldDoList: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("After the dry run, Headroom would free").font(.caption).foregroundStyle(.secondary)
+            Text("First to go when the dry run ends").font(.subheadline).foregroundStyle(.secondary)
             ForEach(rows) { r in
                 HStack {
                     Text(r.name).lineLimit(1)
