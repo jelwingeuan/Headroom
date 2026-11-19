@@ -15,7 +15,7 @@ struct HeadroomApp: App {
         Window("Headroom", id: "main") {
             MainView().environmentObject(model)
         }
-        .defaultSize(width: 720, height: 480)
+        .defaultSize(width: 800, height: 500)
 
         SwiftUI.Settings {
             SettingsView().environmentObject(model)
@@ -99,16 +99,23 @@ struct SpaceBar: View {
                 let w = geo.size.width, x = { (b: Double) in max(w * b / cap - 1, 2) }
                 HStack(spacing: 2) {
                     Rectangle().fill(Color.primary.opacity(0.55)).frame(width: x(max(used, 0)))
-                    if now > 0 { Rectangle().fill(Color.headroom).frame(width: x(now)) }
+                    // Never a sliver: the job running now keeps at least 8 pt, edged so it reads on gray.
+                    if now > 0 {
+                        Rectangle().fill(Color.headroom).frame(width: max(x(now), 8))
+                            .overlay(Rectangle().strokeBorder(Color.primary.opacity(0.6), lineWidth: 1))
+                    }
                     if back > 0 { HatchedBar().frame(width: x(back)) }
                     Rectangle().fill(.quaternary)
                 }
                 .clipShape(Capsule())
+                .overlay(Capsule().strokeBorder(Color.secondary.opacity(0.5), lineWidth: 1)) // the free track shows
                 .overlay(alignment: .leading) {
                     // The budget line: label color with a ring of the background, legible on any segment.
-                    Rectangle().fill(.primary).frame(width: 2, height: 18)
-                        .background(Rectangle().fill(.background).frame(width: 4, height: 20))
-                        .offset(x: w * (1 - Double(budget) / cap) - 1)
+                    if budget > 0 {
+                        Rectangle().fill(.primary).frame(width: 2, height: 18)
+                            .background(Rectangle().fill(.background).frame(width: 4, height: 20))
+                            .offset(x: w * (1 - Double(budget) / cap) - 1)
+                    }
                 }
             }
             .frame(height: 10)
@@ -119,11 +126,20 @@ struct SpaceBar: View {
                 if back > 0 { Swatch(style: .hatched, text: "Can be freed") }
                 Swatch(style: .track, text: "Free")
             }
-            HStack {
-                Label("\(bytes(budget)) budget", systemImage: "line.diagonal").labelStyle(BudgetLabelStyle())
-                Spacer()
-                Text("\(bytes(capacity)) disk").foregroundStyle(.secondary).monospacedDigit()
+            GeometryReader { geo in // the budget label hangs under its marker; the disk size sits at the end
+                let at = geo.size.width * (1 - Double(budget) / cap)
+                ZStack(alignment: .topLeading) {
+                    Text("\(bytes(capacity)) disk").foregroundStyle(.secondary).monospacedDigit()
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                        .opacity(budget > 0 && at > geo.size.width - 150 ? 0 : 1)
+                    if budget > 0 {
+                        Label("\(bytes(budget)) budget", systemImage: "line.diagonal").labelStyle(BudgetLabelStyle())
+                            .fixedSize()
+                            .position(x: min(max(at, 50), geo.size.width - 50), y: 8)
+                    }
+                }
             }
+            .frame(height: 16)
         }
         .font(.subheadline)
         .animation(reduceMotion ? .easeInOut(duration: 0.2) : .spring(response: 0.4, dampingFraction: 1),
@@ -204,7 +220,7 @@ struct MenuView: View {
                 }
             }
 
-            if let free = s.freeBytes, let budget = s.budgetBytes, budget > 0 {
+            if let free = s.freeBytes, let budget = s.budgetBytes {
                 SpaceBar(capacity: s.capacityBytes ?? free, free: free, budget: budget, canBeFreed: s.canComeBack,
                          freeing: mood == .acting ? s.next?.bytes ?? 0 : 0)
             }
@@ -222,7 +238,7 @@ struct MenuView: View {
             if s.needsFullDiskAccess {
                 Notice(symbol: "lock.shield",
                        text: "Headroom can't see some folders yet.",
-                       action: ("Allow Full Disk Access…", openFullDiskAccessSettings))
+                       action: ("Full Disk Access Settings…", openFullDiskAccessSettings))
             }
 
             Divider()
@@ -230,15 +246,28 @@ struct MenuView: View {
             HStack(spacing: 8) {
                 Button("Open Headroom") { open(.history) }.keyboardShortcut("o")
                 Spacer()
-                IconButton(model.paused ? "Resume Headroom" : "Pause Headroom",
-                           symbol: model.paused ? "play.fill" : "pause.fill") { model.paused.toggle() }
-                    .disabled(mood == .noBudget || mood == .failed)
-                IconButton("Settings", symbol: "gearshape") { openSettings() }.keyboardShortcut(",")
-                IconButton("Quit Headroom", symbol: "power") { NSApp.terminate(nil) }.keyboardShortcut("q")
+                Menu {
+                    Button(model.paused ? "Resume Headroom" : "Pause Headroom") { model.paused.toggle() }
+                        .disabled(mood == .noBudget || mood == .failed)
+                    Button("Settings…") { openSettings() }.keyboardShortcut(",")
+                    Divider()
+                    Button("Quit Headroom") { NSApp.terminate(nil) }.keyboardShortcut("q")
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("More")
+                .accessibilityLabel("More")
             }
         }
         .padding(16)
         .frame(width: 320)
+        .background { // ⌘, and ⌘Q work while the panel is open, even with the More menu closed
+            Button("") { openSettings() }.keyboardShortcut(",").opacity(0).accessibilityHidden(true)
+            Button("") { NSApp.terminate(nil) }.keyboardShortcut("q").opacity(0).accessibilityHidden(true)
+        }
         .onAppear {
             model.refresh()
             model.loadHistory()
@@ -250,12 +279,17 @@ struct MenuView: View {
     /// The status line: free space, what can come back, and what Headroom will do.
     private func summary(_ s: Status, _ mood: Mood) -> String {
         var parts: [String] = []
-        if let back = s.canComeBack, back > 0 { parts.append("\(bytes(back)) can be freed") }
+        let now = mood == .acting ? s.next?.bytes ?? 0 : 0
+        if now > 0 { parts.append("freeing \(bytes(now)) now") }
+        if let back = s.canComeBack, back - now > 0 {
+            parts.append("\(bytes(back - now)) \(now > 0 ? "more " : "")can be freed")
+        }
         switch mood {
         case .paused: parts.append("paused")
         default: break
         }
-        return parts.joined(separator: " · ")
+        let line = parts.joined(separator: " · ")
+        return line.prefix(1).uppercased() + line.dropFirst()
     }
 
     @ViewBuilder private func verdict(_ s: Status, _ mood: Mood) -> some View {
@@ -367,25 +401,5 @@ struct WouldDoList: View {
                 Button("Show All \(total)…", action: seeAll).buttonStyle(.link).font(.callout)
             }
         }
-    }
-}
-
-/// A borderless symbol button with a tooltip and a spoken name.
-struct IconButton: View {
-    let title: String
-    let symbol: String
-    let action: () -> Void
-
-    init(_ title: String, symbol: String, action: @escaping () -> Void) {
-        self.title = title
-        self.symbol = symbol
-        self.action = action
-    }
-
-    var body: some View {
-        Button(action: action) { Image(systemName: symbol).frame(width: 20, height: 20) }
-            .buttonStyle(.borderless)
-            .help(title)
-            .accessibilityLabel(title)
     }
 }
