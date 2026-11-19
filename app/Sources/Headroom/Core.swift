@@ -46,9 +46,14 @@ struct Status: Equatable {
     var next: Candidate?
     var needsFullDiskAccess = false
     var snapshotHolding = false
+    /// From the last scan (at most a day old); nil until one has run.
+    var canComeBack: Int64?
+    var protectedBytes: Int64?
     var error: String?
 
     init(_ j: JSON) {
+        canComeBack = j.int("reclaimable_bytes")
+        protectedBytes = j.int("protected_bytes")
         freeBytes = j.int("free_bytes")
         budgetBytes = j.int("budget_bytes")
         dryRun = j.bool("dry_run") ?? false
@@ -72,8 +77,11 @@ struct Candidate: Equatable, Identifiable {
     var undone: Bool
     var reason: String?
     var rebuild: String?
+    /// What a rebuild can't bring back (a simulator's apps and test data), if anything.
+    var dataLoss: String?
 
     init(_ j: JSON) {
+        dataLoss = j.string("data_loss")
         path = j.string("path") ?? ""
         id = j.string("id") ?? j.int("id").map(String.init) ?? path
         kind = j.string("kind") ?? "folder"
@@ -92,6 +100,32 @@ struct Candidate: Equatable, Identifiable {
     var name: String {
         let last = (path as NSString).lastPathComponent
         return last == kind ? (place as NSString).lastPathComponent : last
+    }
+
+    /// The kind in plain words, for people who don't know the tool's folder names.
+    var what: String {
+        switch kind {
+        case "node_modules": "Node packages"
+        case "target", "rust_target": "Rust build files"
+        case ".next": "Next.js build files"
+        case ".venv", "venv": "Python environment"
+        case "DerivedData", "derived_data": "Xcode build files"
+        case "simulator": "iOS simulator"
+        case "model", "ollama", "hf": "AI model"
+        case "app_cache", "electron_cache": "app cache"
+        case "worktree": "agent worktree"
+        case "docker_images", "docker_build_cache": "Docker images"
+        default: kind.hasPrefix(".") ? String(kind.dropFirst()) + " files" : kind
+        }
+    }
+
+    /// Undo puts it back by rebuilding: the verb people should see on the button.
+    var rebuildVerb: String {
+        switch kind {
+        case "model", "ollama", "hf": "Download Again"
+        case "simulator": "Recreate"
+        default: "Rebuild"
+        }
     }
 }
 
