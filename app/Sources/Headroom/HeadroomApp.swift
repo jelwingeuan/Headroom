@@ -9,6 +9,7 @@ struct HeadroomApp: App {
             MenuView().environmentObject(model)
         } label: {
             MenuBarIcon(status: model.status, paused: model.paused)
+                .background(LaunchHook(model: model))
         }
         .menuBarExtraStyle(.window)
 
@@ -144,10 +145,12 @@ struct SpaceBar: View {
         .font(.subheadline)
         .animation(reduceMotion ? .easeInOut(duration: 0.2) : .spring(response: 0.4, dampingFraction: 1),
                    value: free)
-        .accessibilityElement()
-        .accessibilityLabel("Disk")
-        .accessibilityValue("\(bytes(free)) free of \(bytes(capacity)), budget \(bytes(budget))"
-            + (canBeFreed.map { ", \(bytes($0)) can be freed" } ?? ""))
+        // To VoiceOver the chart is a level indicator: how full the disk is, with the details spoken.
+        .accessibilityRepresentation {
+            ProgressView(value: Double(capacity - free), total: Double(max(capacity, 1))) { Text("Disk") }
+                .accessibilityValue("\(bytes(free)) free of \(bytes(capacity)), budget \(bytes(budget))"
+                    + (canBeFreed.map { ", \(bytes($0)) can be freed" } ?? ""))
+        }
     }
 }
 
@@ -246,24 +249,17 @@ struct MenuView: View {
             HStack(spacing: 8) {
                 Button("Open Headroom") { open(.history) }.keyboardShortcut("o")
                 Spacer()
-                Menu {
-                    Button(model.paused ? "Resume Headroom" : "Pause Headroom") { model.paused.toggle() }
-                        .disabled(mood == .noBudget || mood == .failed)
-                    Button("Settings…") { openSettings() }.keyboardShortcut(",")
-                    Divider()
-                    Button("Quit Headroom") { NSApp.terminate(nil) }.keyboardShortcut("q")
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
-                .help("More")
-                .accessibilityLabel("More")
+                // A plain button that opens a real NSMenu: VoiceOver gets a press action, people a menu.
+                Button { showMoreMenu(mood) } label: { Image(systemName: "ellipsis.circle") }
+                    .buttonStyle(.borderless)
+                    .help("More")
+                    .accessibilityLabel("More")
             }
         }
         .padding(16)
         .frame(width: 320)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Headroom")
         .background { // ⌘, and ⌘Q work while the panel is open, even with the More menu closed
             Button("") { openSettings() }.keyboardShortcut(",").opacity(0).accessibilityHidden(true)
             Button("") { NSApp.terminate(nil) }.keyboardShortcut("q").opacity(0).accessibilityHidden(true)
@@ -275,6 +271,18 @@ struct MenuView: View {
     }
 
     private var planned: [Candidate] { model.actions.filter(\.dryRun) }
+
+    private func showMoreMenu(_ mood: Mood) {
+        let menu = NSMenu()
+        let pause = ActionItem(model.paused ? "Resume Headroom" : "Pause Headroom") { model.paused.toggle() }
+        pause.isEnabled = !(mood == .noBudget || mood == .failed)
+        menu.autoenablesItems = false
+        menu.addItem(pause)
+        menu.addItem(ActionItem("Settings…", key: ",") { openSettings() })
+        menu.addItem(.separator())
+        menu.addItem(ActionItem("Quit Headroom", key: "q") { NSApp.terminate(nil) })
+        menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+    }
 
     /// The status line: free space, what can come back, and what Headroom will do.
     private func summary(_ s: Status, _ mood: Mood) -> String {
@@ -402,4 +410,67 @@ struct WouldDoList: View {
             }
         }
     }
+}
+
+extension LaunchHook {
+    /// Developer-only (HEADROOM_DEMO): every 1.5 s free space swings by 20 GB and one History row
+    /// flips between freed and rebuilt, so Instruments can measure the chart and row animations.
+    static func demo(_ model: AppModel) {
+        var up = false
+        Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { _ in
+            guard var status = Core.fixture?["status"] as? JSON, var history = Core.fixture?["history"] as? JSON,
+                  var rows = history["actions"] as? [JSON], let free = status["free_bytes"] as? Int64 else { return }
+            up.toggle()
+            status["free_bytes"] = free + (up ? 20 : -20) * 1_000_000_000
+            if !rows.isEmpty { rows[0]["undone"] = up }
+            history["actions"] = rows
+            Core.fixture?["status"] = status
+            Core.fixture?["history"] = history
+            model.refresh()
+            model.loadHistory()
+        }
+    }
+}
+
+/// Developer-only: HEADROOM_OPEN=main opens the main window at launch, and HEADROOM_OPEN=menu shows
+/// the menu's content in an ordinary window, so UI tests reach them without the menu bar item
+/// (which macOS may hide when the menu bar is full).
+struct LaunchHook: View {
+    let model: AppModel
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Color.clear.frame(width: 0, height: 0).onAppear {
+            switch ProcessInfo.processInfo.environment["HEADROOM_OPEN"] {
+            case "main":
+                openWindow(id: "main")
+            case "settings":
+                openSettings()
+            case "menu":
+                let panel = NSWindow(contentViewController: NSHostingController(
+                    rootView: MenuView().environmentObject(model)))
+                panel.title = "Headroom Menu"
+                panel.makeKeyAndOrderFront(nil)
+            default:
+                return
+            }
+            NSApp.activate(ignoringOtherApps: true)
+            if ProcessInfo.processInfo.environment["HEADROOM_DEMO"] != nil { Self.demo(model) }
+        }
+    }
+}
+
+/// An NSMenuItem that runs a closure, for menus built in code.
+final class ActionItem: NSMenuItem {
+    private let run: () -> Void
+
+    init(_ title: String, key: String = "", run: @escaping () -> Void) {
+        self.run = run
+        super.init(title: title, action: #selector(fire), keyEquivalent: key)
+        target = self
+    }
+
+    @available(*, unavailable) required init(coder: NSCoder) { fatalError() }
+
+    @objc private func fire() { run() }
 }
