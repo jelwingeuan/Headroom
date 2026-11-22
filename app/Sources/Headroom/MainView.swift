@@ -9,6 +9,7 @@ struct MainView: View {
             List(Pane.allCases, selection: $model.pane) { pane in
                 Label(pane.rawValue, systemImage: pane.symbol)
             }
+            .accessibilityLabel("Sections")
             .navigationSplitViewColumnWidth(min: 160, ideal: 180)
         } detail: {
             switch model.pane ?? .history {
@@ -17,6 +18,8 @@ struct MainView: View {
             }
         }
         .frame(minWidth: 720, minHeight: 400)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Headroom")
         .onAppear {
             model.loadHistory()
             model.loadSettings()
@@ -60,6 +63,7 @@ struct HistoryView: View {
                     }
                     .width(min: 90, ideal: 100, max: 120)
                 }
+                .accessibilityLabel("Deleted folders")
                 .contextMenu(forSelectionType: Candidate.ID.self) { ids in
                     if let id = ids.first, let action = done.first(where: { $0.id == id }), !action.undone {
                         Button("\(action.rebuildVerb)…") { asking = action }
@@ -120,6 +124,7 @@ struct WouldHaveDoneView: View {
                     TableColumn("Date Found", value: \.when) { WhenCell(date: $0.date) }
                         .width(min: 100, ideal: 110, max: 130)
                 }
+                .accessibilityLabel("Folders the dry run would delete")
                 .tableStyle(.inset(alternatesRowBackgrounds: true))
             }
         }
@@ -151,6 +156,7 @@ struct FolderCell: View {
         }
         .padding(.vertical, 4)
         .help(action.reason ?? "")
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -174,6 +180,7 @@ struct SizeCell: View {
 
     var body: some View {
         Text(Headroom.bytes(bytes)).monospacedDigit().frame(maxWidth: .infinity, alignment: .trailing)
+            .accessibilityElement(children: .combine)
     }
 }
 
@@ -181,7 +188,10 @@ struct WhenCell: View {
     let date: Date?
 
     var body: some View {
-        if let date { Text(date, format: .relative(presentation: .named)).foregroundStyle(.secondary) }
+        if let date {
+            Text(date, format: .relative(presentation: .named)).foregroundStyle(.secondary)
+                .accessibilityElement(children: .combine)
+        }
     }
 }
 
@@ -223,11 +233,12 @@ struct SettingsView: View {
                         }
                     }
                     Picker("Leave projects alone for", selection: binding.recentDays) {
-                        ForEach([7, 14, 30, 60, 90], id: \.self) { Text("\($0) days").tag($0) }
+                        ForEach([7, 14, 30, 60, 90], id: \.self) { Text("\($0)").tag($0) }
                         if ![7, 14, 30, 60, 90].contains(binding.wrappedValue.recentDays) {
                             Text("\(binding.wrappedValue.recentDays) days").tag(binding.wrappedValue.recentDays)
                         }
                     }
+                    .pickerStyle(.segmented)
                 } header: {
                     Text("Free Space")
                 } footer: {
@@ -256,17 +267,18 @@ struct SettingsView: View {
                         Button("Open Login Items…") { SMAppService.openSystemSettingsLoginItems() }
                     }
                 }
-                LabeledContent {
+                LabeledContent("Full Disk Access") {
                     Button("Full Disk Access Settings…") { openFullDiskAccessSettings() }
-                } label: {
-                    Text("Full Disk Access")
-                    Text(model.status.needsFullDiskAccess ? "Off: some folders can't be measured" : "No folders blocked")
                 }
+                Text(model.status.needsFullDiskAccess ? "Off: some folders can't be measured." : "No folders are blocked.")
+                    .foregroundStyle(.secondary)
             } header: {
                 Text("General")
             }
         }
         .formStyle(.grouped)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Settings")
         .frame(width: 460)
         .fixedSize(horizontal: false, vertical: true)
         .onAppear {
