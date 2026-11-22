@@ -4,14 +4,12 @@ import UserNotifications
 
 enum Pane: String, CaseIterable, Identifiable {
     case history = "History"
-    case wouldHaveDone = "Would Have Done"
-    case settings = "Settings"
+    case wouldHaveDone = "Dry Run"
     var id: Self { self }
     var symbol: String {
         switch self {
         case .history: "clock.arrow.circlepath"
-        case .wouldHaveDone: "list.bullet.clipboard"
-        case .settings: "gearshape"
+        case .wouldHaveDone: "eye"
         }
     }
 }
@@ -29,6 +27,16 @@ final class AppModel: ObservableObject {
     }
 
     private var timers: [DispatchSourceTimer] = []
+
+    /// Screenshot mode: load everything synchronously from Core.fixture, no timers.
+    init(fixture: JSON, pane: Pane) {
+        Core.fixture = fixture
+        status = Status(Core.call(["op": "status"]))
+        let h = Core.call(["op": "history"])
+        actions = (h.objects("actions") + h.objects("items")).map(Candidate.init)
+        settings = Settings(Core.call(["op": "settings_get"]))
+        self.pane = pane
+    }
 
     init() {
         if UserDefaults.standard.object(forKey: "lastDigest") == nil {
