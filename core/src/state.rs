@@ -233,6 +233,47 @@ pub fn log_dry_run(ctx: &Ctx, entry: Json) {
     })
 }
 
+// ---------------------------------------------------------------- free-space samples
+
+const SAMPLE_DAYS: u64 = 400;
+
+/// Free space over time, for Insights: adds `{"at","free","budget"}` to samples.jsonl when the
+/// last row is at least an hour old. Rows older than 400 days are dropped by rewriting the file
+/// once its oldest row is a day past that, so at most once a day; it never holds more than
+/// 24 × 401 + 1 rows (about 0.6 MB).
+pub fn sample(ctx: &Ctx, free: u64, budget: u64) {
+    locked(ctx, || {
+        let path = ctx.file("samples.jsonl");
+        let text = fs::read_to_string(&path).unwrap_or_default();
+        let at = |l: &str| Json::parse(l).ok()?.get("at")?.u64();
+        if text.lines().rev().find_map(at).is_some_and(|t| ctx.now < t + 3600) {
+            return;
+        }
+        let row = obj! {"at" => ctx.now, "free" => free, "budget" => budget};
+        let keep = ctx.now.saturating_sub(SAMPLE_DAYS * DAY);
+        let written = if text.lines().find_map(at).is_some_and(|t| t + DAY < keep) {
+            let mut rows: Vec<Json> = text
+                .lines()
+                .filter_map(|l| Json::parse(l).ok())
+                .filter(|r| r.get("at").and_then(Json::u64).is_some_and(|t| t >= keep))
+                .collect();
+            rows.push(row);
+            write_lines(&path, &rows)
+        } else {
+            // A row cut short (the disk filled up mid-write) must not swallow the next one.
+            let sep = if text.is_empty() || text.ends_with('\n') { "" } else { "\n" };
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .and_then(|mut f| f.write_all(format!("{sep}{row}\n").as_bytes()))
+        };
+        if let Err(e) = written {
+            eprintln!("headroom: could not write samples: {e}");
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,5 +299,40 @@ mod tests {
         let h = history(&ctx);
         assert_eq!(h.len(), 1);
         assert_eq!(h[0].get("undone"), Some(&Json::Bool(true)));
+    }
+
+    #[test]
+    fn samples_are_hourly_kept_400_days_and_stay_under_1_mb() {
+        use std::os::unix::fs::MetadataExt;
+        let mut ctx = crate::testutil::ctx("state-samples");
+        let file = ctx.file("samples.jsonl");
+        let t0 = 1_800_000_000;
+        let free = |ctx: &Ctx| {
+            read_lines(&ctx.file("samples.jsonl")).iter().filter_map(|r| r.get("free")?.u64()).collect::<Vec<_>>()
+        };
+        for (dt, f) in [(0, 5), (3599, 6), (3600, 7)] {
+            ctx.now = t0 + dt;
+            sample(&ctx, f, 1);
+        }
+        assert_eq!(free(&ctx), [5, 7], "a row at most once an hour");
+        // The app ticks every 10 minutes: 430 days of that, with terabyte-sized numbers.
+        let (mut ino, mut rewrites, mut last_rewrite, mut biggest) = (fs::metadata(&file).unwrap().ino(), 0, 0, 0);
+        for i in 1..=430 * DAY / 600 {
+            ctx.now = t0 + 3600 + i * 600;
+            sample(&ctx, 4_000_000_000_000 + i, 1_000_000_000_000);
+            let m = fs::metadata(&file).unwrap();
+            biggest = biggest.max(m.len());
+            if m.ino() != ino {
+                assert!(ctx.now >= last_rewrite + DAY, "rewritten twice in a day");
+                (ino, rewrites, last_rewrite) = (m.ino(), rewrites + 1, ctx.now);
+            }
+        }
+        assert!(biggest < 1 << 20, "samples.jsonl reached {biggest} bytes");
+        assert!(rewrites >= 25, "old rows were pruned only {rewrites} times");
+        let at: Vec<u64> = read_lines(&file).iter().map(|r| r.get("at").and_then(Json::u64).unwrap()).collect();
+        assert!(at.windows(2).all(|w| w[1] >= w[0] + 3600), "oldest first, an hour apart");
+        assert!(at[0] + (SAMPLE_DAYS + 1) * DAY > ctx.now, "dropped after 400 days (a day more at most)");
+        assert!(at.len() <= 24 * (SAMPLE_DAYS as usize + 1) + 1, "{} rows", at.len());
+        assert!(ctx.now - at.last().unwrap() < 3600, "still sampling");
     }
 }
