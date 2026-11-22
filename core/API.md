@@ -56,6 +56,7 @@ Cheap: one `statvfs` and a few small files, no scan. Call it as often as needed.
   under budget pressure always scans (dry run included); any other tick, with plenty of space
   or no budget chosen, makes one read-only scan when the saved totals are missing or 24 hours
   old, and deletes nothing. So the totals are at most a day old while ticks run.
+- `breakdown` lists the folders behind these totals.
 
 ### `history`
 ```json
@@ -99,6 +100,49 @@ The weekly summary for a notification:
 {"title": "Your week with Headroom", "body": "Headroom freed 3.2 GB from 5 folders it can rebuild. …",
  "freed_bytes": 3200000000, "actions": 5, "would_bytes": 0, "shortfalls": 0}
 ```
+
+### `samples`
+Free space over time, for the Insights chart. Cheap: reads `samples.jsonl`, no scan.
+```json
+{"samples": [{"at": 1763251200, "free": 52000000000, "budget": 20000000000},
+             {"at": 1763254800, "free": 51800000000, "budget": 20000000000}]}
+```
+- Oldest first, at least an hour apart. `free` is the free space a tick saw as it started
+  (before it reclaimed anything), and `budget` the budget then (0: none chosen).
+- Every tick (the `tick` op, `autopilot --once`, the agent) adds a row when the last one is at
+  least an hour old, so the app's 10-minute ticks give one row an hour. Hours with no tick
+  have no row.
+- Rows older than 400 days are dropped, at most once a day, so up to a day of rows 400 to 401
+  days old can still be there. The file never holds more than 24 × 401 + 1 rows, about 0.6 MB.
+- `[]` before the first tick.
+
+### `breakdown`
+What the tick behind `status`'s totals measured, folder by folder. Cheap: reads
+`last-scan.json`, no scan.
+```json
+{"entries": [{"path": "/Users/me/code/old/node_modules", "kind": "node_modules", "bytes": 412000000,
+              "free": true, "reason": "Node project (package.json); git ignores it; last used 92 days ago; rebuild: npm ci"},
+             {"path": "/Users/me/code/app/node_modules", "kind": "node_modules", "bytes": 380000000,
+              "free": false, "reason": "used 2 days ago (recent: the last 14 days)"}],
+ "kinds": {"node_modules": {"free_bytes": 30000000000, "protected_bytes": 15000000000},
+           "ai_history": {"free_bytes": 0, "protected_bytes": 3000000000}},
+ "totals_at": 1763251200}
+```
+- `free: true`: autopilot could still reclaim it (counted in `reclaimable_bytes`).
+  `free: false`: kept, and `reason` says why (counted in `protected_bytes`). `reason` is the
+  text `scan --json` gives.
+- The same numbers as `status`: summed over every kind, `free_bytes` is `reclaimable_bytes`
+  and `protected_bytes` is `protected_bytes`, and `totals_at` is the same tick's. Each folder
+  is counted once: a kept folder holding folders that may go counts only the rest, a kept
+  folder inside another candidate is counted in that one and not listed, and Docker is left
+  out (its space stays inside its VM disk).
+- `entries` holds the 2,000 largest, largest first; `kinds` covers everything. A kind's bytes
+  not in `entries` are its totals minus its listed entries.
+- Against `scan <home> --json` on an unchanged disk: every entry it marks reclaimable, Docker's
+  aside, is here with the same `bytes` and `reason`. Kept entries (other than those inside
+  another candidate) are here too, but match by path only: for speed `scan` doesn't size kept
+  folders (most show 0 bytes there), while the tick sizes them for these totals.
+- All three are `null` until a tick has scanned.
 
 ## Autopilot events (`tick` op and `headroom autopilot --once`, one JSON object per line)
 
@@ -144,6 +188,16 @@ deleted), `ollama_model`, `hf_model`, `lmstudio_model`, `docker_images`, `docker
 `clean --apply --json` also prints `dedupe: {files, bytes}`: identical files in kept
 `node_modules` of projects sharing a lockfile, swapped for clones after the deletes; `bytes` is
 what statfs saw come free and is included in `freed_bytes`.
+
+## What the Insights files hold
+
+- `HEADROOM_HOME/samples.jsonl`, one sample per line, oldest first: `at` (unix seconds),
+  `free` and `budget` (bytes). Written by ticks under the HEADROOM_HOME lock: appended at most
+  hourly; rewritten atomically (temporary file and rename) at most once a day to drop rows
+  older than 400 days. Lines that don't parse are skipped.
+- `HEADROOM_HOME/last-scan.json`, one object: exactly what `breakdown` returns. Rewritten
+  atomically by every tick that scans (any tick under pressure, else at most daily), under
+  the same lock as the state file holding `status`'s totals, so both come from the same tick.
 
 ## Known limits
 
