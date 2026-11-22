@@ -35,6 +35,8 @@ final class AccessibilityAuditTests: XCTestCase {
             menu.terminate()
             guard world == "plenty" || world == "first-run" else { continue }
             let app = launch(world, open: "main")
+            audit(app, "window insights \(world)")
+            app.outlines.staticTexts["History"].firstMatch.click()
             audit(app, "window history \(world)")
             app.outlines.staticTexts["Dry Run"].firstMatch.click()
             audit(app, "window dry-run \(world)")
