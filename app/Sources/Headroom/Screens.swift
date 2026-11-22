@@ -52,12 +52,18 @@ enum Screens {
         ("light-contrast", .accessibilityHighContrastAqua), ("dark-contrast", .accessibilityHighContrastDarkAqua),
     ]
 
+    static func fixture(_ world: String) -> JSON? {
+        guard let (_, status, rows, settings) = worlds.first(where: { $0.0 == world }) else { return nil }
+        return ["status": status, "history": ["actions": rows], "settings_get": settings,
+                "undo": ["ok": true], "tick": ["events": []], "settings_set": settings]
+    }
+
     static func render(to dir: URL) {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        for (world, status, rows, settings) in worlds {
-            let fixture: JSON = ["status": status, "history": ["actions": rows], "settings_get": settings]
+        for (world, _, _, _) in worlds {
+            let fixture = Self.fixture(world)!
             for (look, name) in looks {
                 let appearance = NSAppearance(named: name)!
                 let menu = AppModel(fixture: fixture, pane: .history)
