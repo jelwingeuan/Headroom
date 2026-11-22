@@ -230,6 +230,10 @@ struct MenuView: View {
 
             verdict(s, mood)
 
+            if model.ticking > 0 || model.lastCheck != nil {
+                LiveLine(checking: model.ticking > 0, last: model.lastCheck)
+            }
+
             if s.dryRun && !planned.isEmpty && mood != .noBudget {
                 WouldDoList(rows: Array(planned.prefix(3)), total: planned.count) { open(.wouldHaveDone) }
             }
@@ -247,7 +251,7 @@ struct MenuView: View {
             Divider()
             // Real controls, not imitation menu items: a window-style extra gets a footer bar.
             HStack(spacing: 8) {
-                Button("Open Headroom") { open(.history) }.keyboardShortcut("o")
+                Button("Open Headroom") { open(.insights) }.keyboardShortcut("o")
                 Spacer()
                 // A plain button that opens a real NSMenu: VoiceOver gets a press action, people a menu.
                 Button { showMoreMenu(mood) } label: { Image(systemName: "ellipsis.circle") }
@@ -382,6 +386,32 @@ struct Notice: View {
                 }
             }
         }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// "Checking your disk…" while a tick runs, then what it did and when.
+struct LiveLine: View {
+    let checking: Bool
+    let last: LastCheck?
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if checking {
+                ProgressView().controlSize(.small).frame(width: 20)
+                Text("Checking your disk…")
+            } else if let last {
+                Image(systemName: last.failed ? "exclamationmark.circle" : last.acted ? "checkmark.circle.fill" : "checkmark.circle")
+                    .foregroundStyle(last.acted ? Color.headroom : .secondary)
+                    .frame(width: 20)
+                Text("\(last.text) · \(last.at.formatted(date: .omitted, time: .shortened))")
+                    .lineLimit(2)
+                    .accessibilityLabel("Last check at \(last.at.formatted(date: .omitted, time: .shortened)): \(last.text)")
+            }
+        }
+        .font(.callout)
+        .foregroundStyle(.secondary)
+        .monospacedDigit()
         .accessibilityElement(children: .combine)
     }
 }

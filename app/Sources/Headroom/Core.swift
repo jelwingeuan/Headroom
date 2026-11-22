@@ -51,9 +51,15 @@ struct Status: Equatable {
     /// Size of the disk that holds the home folder: the chart's fixed scale.
     var capacityBytes: Int64?
     var protectedBytes: Int64?
+    /// protectedBytes split by why it's kept: recent, in_use, history, other.
+    var protectedByReason: [String: Int64] = [:]
+    /// When the scan behind these totals ran.
+    var totalsAt: Date?
     var error: String?
 
     init(_ j: JSON) {
+        protectedByReason = (j.object("protected_by_reason") ?? [:]).compactMapValues { ($0 as? NSNumber)?.int64Value }
+        totalsAt = j.int("totals_at").map { Date(timeIntervalSince1970: TimeInterval($0)) }
         canComeBack = j.int("reclaimable_bytes")
         capacityBytes = j.int("capacity_bytes") ?? (try? URL(fileURLWithPath: NSHomeDirectory())
             .resourceValues(forKeys: [.volumeTotalCapacityKey]).volumeTotalCapacity).map(Int64.init)
@@ -83,12 +89,23 @@ struct Candidate: Equatable, Identifiable {
     var rebuild: String?
     /// What a rebuild can't bring back (a simulator's apps and test data), if anything.
     var dataLoss: String?
+    /// False for Docker, whose space stays inside its VM disk.
+    var freesHost: Bool
+    /// How long Undo's rebuild took, when the core reports it.
+    var rebuildSecs: Int64?
+    /// breakdown entries: true when autopilot could still reclaim it, false when it's kept.
+    var canFree: Bool
 
     init(_ j: JSON) {
         dataLoss = j.string("data_loss")
         path = j.string("path") ?? ""
         id = j.string("id") ?? j.int("id").map(String.init) ?? path
         kind = j.string("kind") ?? "folder"
+        // shortcut: the history op doesn't pass frees_host on, so it's inferred the way the core
+        // sets it (false only for Docker); read the field once the op returns it.
+        freesHost = j.bool("frees_host") ?? !kind.hasPrefix("docker_")
+        rebuildSecs = j.int("rebuild_secs")
+        canFree = j.bool("free") ?? false
         bytes = j.int("bytes") ?? 0
         date = j.int("at").map { Date(timeIntervalSince1970: TimeInterval($0)) }
         dryRun = j.bool("dry_run") ?? false

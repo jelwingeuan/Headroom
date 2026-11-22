@@ -12,7 +12,8 @@ struct MainView: View {
             .accessibilityLabel("Sections")
             .navigationSplitViewColumnWidth(min: 160, ideal: 180)
         } detail: {
-            switch model.pane ?? .history {
+            switch model.pane ?? .insights {
+            case .insights: InsightsView()
             case .history: HistoryView()
             case .wouldHaveDone: WouldHaveDoneView()
             }
@@ -89,7 +90,7 @@ struct HistoryView: View {
         let done = actions.filter { !$0.dryRun }, kept = done.filter { !$0.undone }
         guard !done.isEmpty else { return "" }
         let rebuilt = done.count - kept.count
-        return "\(bytes(kept.reduce(0) { $0 + $1.bytes })) freed"
+        return "\(bytes(kept.filter(\.freesHost).reduce(0) { $0 + $1.bytes })) freed"
             + (rebuilt > 0 ? " · \(rebuilt) of \(done.count) rebuilt" : "")
     }
 

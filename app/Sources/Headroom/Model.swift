@@ -3,11 +3,13 @@ import ServiceManagement
 import UserNotifications
 
 enum Pane: String, CaseIterable, Identifiable {
+    case insights = "Insights"
     case history = "History"
     case wouldHaveDone = "Dry Run"
     var id: Self { self }
     var symbol: String {
         switch self {
+        case .insights: "chart.bar.xaxis"
         case .history: "clock.arrow.circlepath"
         case .wouldHaveDone: "eye"
         }
@@ -20,7 +22,13 @@ final class AppModel: ObservableObject {
     @Published private(set) var actions: [Candidate] = []
     @Published private(set) var settings: Settings?
     @Published private(set) var undoing: Set<String> = []
-    @Published var pane: Pane? = .history
+    /// The `samples` and `breakdown` replies, for Insights.
+    @Published private(set) var samples: JSON = [:]
+    @Published private(set) var breakdown: JSON = [:]
+    /// Ticks in flight, and what the last one did: the menu's live line.
+    @Published private(set) var ticking = 0
+    @Published private(set) var lastCheck: LastCheck?
+    @Published var pane: Pane? = .insights
     @Published var alert: String?
     @Published var paused = UserDefaults.standard.bool(forKey: "paused") {
         didSet { UserDefaults.standard.set(paused, forKey: "paused") }
@@ -35,6 +43,9 @@ final class AppModel: ObservableObject {
         let h = Core.call(["op": "history"])
         actions = (h.objects("actions") + h.objects("items")).map(Candidate.init)
         settings = Settings(Core.call(["op": "settings_get"]))
+        samples = Core.call(["op": "samples"])
+        breakdown = Core.call(["op": "breakdown"])
+        if let tick = fixture["tick"] as? JSON { lastCheck = LastCheck(tick) } else { ticking = 1 } // no reply yet: in flight
         self.pane = pane
     }
 
@@ -72,6 +83,11 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func loadInsights() {
+        send(["op": "samples"]) { [weak self] in self?.samples = $0 }
+        send(["op": "breakdown"]) { [weak self] in self?.breakdown = $0 }
+    }
+
     func undo(_ action: Candidate) {
         undoing.insert(action.id)
         send(["op": "undo", "id": action.id]) { [weak self] reply in
@@ -104,7 +120,13 @@ final class AppModel: ObservableObject {
     private func tick() {
         maybeSendDigest()
         guard !paused else { return }
-        send(["op": "tick"]) { [weak self] _ in self?.refresh() }
+        ticking += 1
+        send(["op": "tick"]) { [weak self] reply in
+            self?.ticking -= 1
+            self?.lastCheck = LastCheck(reply)
+            self?.refresh()
+            self?.loadInsights()
+        }
     }
 
     // MARK: Weekly digest
@@ -159,4 +181,41 @@ final class AppModel: ObservableObject {
 
 func openFullDiskAccessSettings() {
     NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!)
+}
+
+/// Question 5, "What is it doing right now?": one line from a tick's events and when it ran.
+struct LastCheck {
+    let text: String
+    /// Headroom deleted or shared something: the line gets Headroom's teal.
+    let acted: Bool
+    let failed: Bool
+    let at: Date
+
+    init(_ reply: JSON, at: Date = Date()) {
+        self.at = at
+        let events = reply.objects("events")
+        let all = { (name: String) in events.filter { $0.string("event") == name }.map(Candidate.init) }
+        let more = { (rows: [Candidate]) in rows.count > 1 ? " and \(rows.count - 1) more" : "" }
+        let freed = all("reclaim"), skipped = all("skip"), would = all("would_reclaim")
+        let shared = events.filter { $0.string("event") == "shrink" }.reduce(Int64(0)) { $0 + ($1.int("bytes") ?? 0) }
+        acted = !freed.isEmpty || shared > 0
+        let error = reply.error ?? events.first(where: { $0.string("event") == "error" })?.string("error")
+        failed = error != nil
+        if let error {
+            text = "Couldn't check: \(error)"
+        } else if let first = freed.first {
+            text = "Freed \(bytes(freed.reduce(0) { $0 + $1.bytes })) from \(first.name)\(more(freed))"
+        } else if shared > 0 {
+            text = "Freed \(bytes(shared)) by sharing identical files"
+        } else if let first = skipped.first {
+            text = first.reason?.hasPrefix("in use") == true ? "Waiting: \(first.name) is in use"
+                : "Skipped \(first.name): \(first.reason ?? "it changed")"
+        } else if let first = would.first {
+            text = "Dry run: would free \(bytes(would.reduce(0) { $0 + $1.bytes })) from \(first.name)\(more(would))"
+        } else if events.contains(where: { $0.string("event") == "shortfall" }) {
+            text = "Below budget, and nothing left is safe to free"
+        } else {
+            text = "Nothing to do"
+        }
+    }
 }
