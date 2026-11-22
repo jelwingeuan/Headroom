@@ -9,12 +9,8 @@ enum Core {
     /// headroom_call is not assumed to be thread-safe, so every call goes through this queue.
     static let queue = DispatchQueue(label: "io.github.jelwingeuan.headroom.core", qos: .utility)
 
-    /// Screenshot mode only (see Screens.swift): canned replies by op, so every render is identical.
-    static var fixture: JSON?
-
     /// Blocking; call it on `queue`.
     static func call(_ request: JSON) -> JSON {
-        if let fixture { return fixture[request["op"] as? String ?? ""] as? JSON ?? ["error": "no fixture"] }
         guard let data = try? JSONSerialization.data(withJSONObject: request),
               let text = String(data: data, encoding: .utf8)
         else { return ["error": "Headroom couldn't encode a request. Please report this bug."] }
@@ -46,18 +42,9 @@ struct Status: Equatable {
     var next: Candidate?
     var needsFullDiskAccess = false
     var snapshotHolding = false
-    /// From the last scan (at most a day old); nil until one has run.
-    var canComeBack: Int64?
-    /// Size of the disk that holds the home folder: the chart's fixed scale.
-    var capacityBytes: Int64?
-    var protectedBytes: Int64?
     var error: String?
 
     init(_ j: JSON) {
-        canComeBack = j.int("reclaimable_bytes")
-        capacityBytes = j.int("capacity_bytes") ?? (try? URL(fileURLWithPath: NSHomeDirectory())
-            .resourceValues(forKeys: [.volumeTotalCapacityKey]).volumeTotalCapacity).map(Int64.init)
-        protectedBytes = j.int("protected_bytes")
         freeBytes = j.int("free_bytes")
         budgetBytes = j.int("budget_bytes")
         dryRun = j.bool("dry_run") ?? false
@@ -81,11 +68,8 @@ struct Candidate: Equatable, Identifiable {
     var undone: Bool
     var reason: String?
     var rebuild: String?
-    /// What a rebuild can't bring back (a simulator's apps and test data), if anything.
-    var dataLoss: String?
 
     init(_ j: JSON) {
-        dataLoss = j.string("data_loss")
         path = j.string("path") ?? ""
         id = j.string("id") ?? j.int("id").map(String.init) ?? path
         kind = j.string("kind") ?? "folder"
@@ -97,45 +81,13 @@ struct Candidate: Equatable, Identifiable {
         rebuild = j.string("rebuild")
     }
 
-    /// For sorting: rows without a time sort as oldest.
-    var when: Date { date ?? .distantPast }
-
     var shortPath: String { (path as NSString).abbreviatingWithTildeInPath }
     /// The folder that holds it, e.g. "~/code/app" for "~/code/app/node_modules".
     var place: String { (shortPath as NSString).deletingLastPathComponent }
     /// "app" for ~/code/app/node_modules; "Foo-abc" for DerivedData/Foo-abc.
     var name: String {
         let last = (path as NSString).lastPathComponent
-        if last == kind { return (place as NSString).lastPathComponent }
-        // Xcode names DerivedData folders "<Project>-<28-letter hash>"; people know the project.
-        if place.hasSuffix("DerivedData"), let dash = last.lastIndex(of: "-") { return String(last[..<dash]) }
-        return last
-    }
-
-    /// The kind in plain words, for people who don't know the tool's folder names.
-    var what: String {
-        switch kind {
-        case "node_modules": "Node packages"
-        case "target", "rust_target": "Rust build files"
-        case ".next": "Next.js build files"
-        case ".venv", "venv": "Python environment"
-        case "DerivedData", "derived_data": "Xcode build files"
-        case "simulator": "iOS simulator"
-        case "model", "ollama", "hf": "AI model"
-        case "app_cache", "electron_cache": "app cache"
-        case "worktree": "agent worktree"
-        case "docker_images", "docker_build_cache": "Docker images"
-        default: kind.hasPrefix(".") ? String(kind.dropFirst()) + " files" : kind
-        }
-    }
-
-    /// Undo puts it back by rebuilding: the verb people should see on the button.
-    var rebuildVerb: String {
-        switch kind {
-        case "model", "ollama", "hf": "Download Again"
-        case "simulator": "Recreate"
-        default: "Rebuild"
-        }
+        return last == kind ? (place as NSString).lastPathComponent : last
     }
 }
 
