@@ -22,8 +22,20 @@ pub fn call(request: &str) -> Json {
         "settings_set" => settings_set(&ctx, &req),
         "tick" => tick(&ctx),
         "digest" => digest(&ctx),
+        "samples" => samples(&ctx),
+        "breakdown" => breakdown(&ctx),
         op => error(format!("unknown op {op:?}")),
     }
+}
+
+fn samples(ctx: &Ctx) -> Json {
+    obj! {"samples" => state::read_lines(&ctx.file("samples.jsonl"))}
+}
+
+/// What the last tick that scanned measured, as it saved it; no scan here.
+fn breakdown(ctx: &Ctx) -> Json {
+    state::read_json(&ctx.file("last-scan.json"))
+        .unwrap_or_else(|| obj! {"entries" => Json::Null, "kinds" => Json::Null, "totals_at" => Json::Null})
 }
 
 fn status(ctx: &Ctx) -> Json {
@@ -270,6 +282,78 @@ mod tests {
             c.now += 3600;
             crate::autopilot::tick(&c, budget, &mut |_| {});
             assert_eq!(scans(), before + 2);
+        }
+    }
+
+    #[test]
+    fn breakdown_adds_up_to_status_and_lists_what_scan_reclaims() {
+        use crate::testutil::{git, script, touch, world, write};
+        let mut ctx = crate::testutil::ctx("api-breakdown");
+        ctx.machine = true; // AI history and Docker are machine-wide places
+        for (name, when) in [("cold", 1_600_000_000), ("recent", ctx.now - DAY)] {
+            let p = ctx.home.join("code").join(name);
+            write(&p.join("package.json"), "{}");
+            write(&p.join("package-lock.json"), "{}");
+            write(&p.join(".gitignore"), "node_modules/\n");
+            git(&p, &["init", "-q"], Some(when));
+            git(&p, &["add", "-A"], Some(when));
+            git(&p, &["commit", "-qm", "c"], Some(when));
+            std::fs::create_dir_all(p.join("node_modules/x")).unwrap();
+            std::fs::write(p.join("node_modules/x/blob.js"), vec![1u8; 1 << 20]).unwrap();
+            write(&p.join("node_modules/.package-lock.json"), "{}");
+            touch(&p.join("node_modules/x/blob.js"), when);
+        }
+        write(&ctx.home.join(".claude/projects/x/a.jsonl"), &"history\n".repeat(1000));
+        // Docker's build cache may go, but its space stays inside Docker's VM disk.
+        let docker = world(&ctx).join("docker");
+        script(&docker, r#"[ "$1 $2" = "system df" ] && echo '{"Type":"Build Cache","Reclaimable":"1.5GB"}'"#);
+        ctx.path_var = format!("{}:/usr/bin:/bin", world(&ctx).display());
+        let scans = || crate::scan::SCANS.with(|n| n.get());
+        let n = |j: &Json, k: &str| j.get(k).and_then(Json::u64).unwrap_or_else(|| panic!("{k} in {j}"));
+        // Under pressure (a dry run: nothing is deleted) and with no budget chosen.
+        for budget in [sys::free_bytes(&ctx.home) + (1 << 40), 0] {
+            let mut c = ctx.clone();
+            c.state = ctx.state.join(format!("b{budget}"));
+            let b = breakdown(&c);
+            for k in ["entries", "kinds", "totals_at"] {
+                assert_eq!(b.get(k), Some(&Json::Null), "{k} before any tick");
+            }
+            crate::autopilot::tick(&c, budget, &mut |_| {});
+            let before = scans();
+            let (s, b, rows) = (status(&c), breakdown(&c), samples(&c));
+            assert_eq!(scans(), before, "status, breakdown and samples never scan");
+            let row = &rows.get("samples").unwrap().arr()[0];
+            assert_eq!((n(row, "at"), n(row, "budget")), (c.now, budget));
+            assert!(n(row, "free") > 0);
+
+            // The per-kind totals are exactly the status totals.
+            assert_eq!(b.get("totals_at"), s.get("totals_at"));
+            let Some(Json::Obj(kinds)) = b.get("kinds") else { panic!("{b}") };
+            let sum = |k: &str| kinds.iter().map(|(_, t)| n(t, k)).sum::<u64>();
+            assert_eq!(sum("free_bytes"), n(&s, "reclaimable_bytes"), "{b}");
+            assert_eq!(sum("protected_bytes"), n(&s, "protected_bytes"), "{b}");
+            assert!(n(&s, "reclaimable_bytes") >= 1 << 20 && n(&s, "protected_bytes") >= (1 << 20) + 8000, "{s}");
+
+            // UI equals CLI: `scan --json` prints these objects (cli.rs).
+            let entries = b.get("entries").unwrap().arr();
+            let listed: Vec<Json> =
+                crate::scan::scan(&c, &c.home).unwrap().cands.iter().map(crate::scan::Cand::to_json).collect();
+            assert!(listed.iter().any(|e| e.s("kind") == "docker_build_cache"), "the fake docker was seen");
+            for e in &listed {
+                let found = entries.iter().find(|x| x.s("path") == e.s("path"));
+                if e.s("kind").starts_with("docker_") {
+                    assert!(found.is_none(), "Docker frees nothing on this volume: {e}");
+                } else if e.get("reclaimable") == Some(&Json::Bool(true)) {
+                    let f = found.unwrap_or_else(|| panic!("{e} missing from {b}"));
+                    assert_eq!(f.get("free"), Some(&Json::Bool(true)), "{f}");
+                    assert_eq!((f.get("bytes"), f.s("reason")), (e.get("bytes"), e.s("reason")), "{f}");
+                } else {
+                    // Kept: by path only, since `scan` leaves kept folders unsized (a speed choice).
+                    let f = found.unwrap_or_else(|| panic!("{e} missing from {b}"));
+                    assert_eq!(f.get("free"), Some(&Json::Bool(false)), "{f}");
+                }
+            }
+            assert_eq!(entries.len(), listed.len() - 1, "nothing listed that scan doesn't list");
         }
     }
 
