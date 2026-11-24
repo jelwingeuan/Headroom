@@ -6,71 +6,76 @@ struct MainView: View {
 
     var body: some View {
         NavigationSplitView {
-            List(Pane.allCases, selection: $model.pane) { pane in
+            List(Pane.allCases, selection: Binding(get: { model.pane }, set: { if let p = $0 { model.pane = p } })) { pane in
                 Label(pane.rawValue, systemImage: pane.symbol)
             }
             .accessibilityLabel("Sections")
-            .navigationSplitViewColumnWidth(min: 160, ideal: 180)
+            .safeAreaInset(edge: .top) {
+                HStack(spacing: 8) {
+                    Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 32, height: 32).accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text("Headroom").font(.headline)
+                        Text("Keeps the space you chose").font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 16).padding(.vertical, 8)
+                .accessibilityElement(children: .combine)
+            }
+            .safeAreaInset(edge: .bottom) {
+                Text(version).font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(16)
+            }
+            .navigationSplitViewColumnWidth(min: 180, ideal: 200)
         } detail: {
-            switch model.pane ?? .insights {
+            switch model.pane {
+            case .overview: OverviewView()
             case .insights: InsightsView()
             case .history: HistoryView()
-            case .wouldHaveDone: WouldHaveDoneView()
+            case .settings: SettingsView().frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top).navigationTitle("Settings")
+            case .about: ScrollView { About(recentDays: model.settings?.recentDays ?? 14).padding(24).frame(maxWidth: 640, alignment: .leading) }
+                .navigationTitle("About Headroom")
             }
         }
-        .frame(minWidth: 720, minHeight: 400)
+        .frame(minWidth: 800, minHeight: 480)
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Headroom")
         .onAppear {
             model.loadHistory()
             model.loadSettings()
+            model.loadInsights()
         }
-        .onChange(of: model.pane) { _ in model.loadHistory() }
         .alert(model.alert ?? "", isPresented: Binding(
             get: { model.alert != nil }, set: { if !$0 { model.alert = nil } }
         )) {
             Button("OK", role: .cancel) {}
         }
     }
+
+    private var version: String {
+        (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String).map { "Version \($0)" } ?? "Development build"
+    }
 }
 
+/// Every delete, newest first, on the Overview's own row. A dry-run row says what would have gone.
 struct HistoryView: View {
     @EnvironmentObject private var model: AppModel
     @State private var asking: Candidate?
-    @State private var order = [KeyPathComparator(\Candidate.when, order: .reverse)]
 
     var body: some View {
-        let done = model.actions.filter { !$0.dryRun }
+        let rows = model.actions.sorted { $0.when > $1.when }
         Group {
-            if done.isEmpty {
+            if rows.isEmpty {
                 EmptyState(symbol: "clock.arrow.circlepath", title: "Nothing deleted yet",
                            detail: "When Headroom frees space, each folder shows up here, and you can rebuild it with one click.",
-                           action: model.status.budgetBytes == 0 ? ("Set a Budget…", openSettings) : nil)
+                           action: model.status.budgetBytes == 0 ? ("Set a Budget…", { model.pane = .settings }) : nil)
             } else {
-                Table(done.sorted(using: order), sortOrder: $order) {
-                    TableColumn("Folder", value: \.name) { FolderCell(action: $0) }.width(min: 160, ideal: 200, max: 220)
-                    TableColumn("Size", value: \.bytes) { SizeCell(bytes: $0.bytes) }
-                        .width(min: 70, ideal: 80, max: 100)
-                    TableColumn("Date Freed", value: \.when) { WhenCell(date: $0.date) }
-                        .width(min: 100, ideal: 110, max: 130)
-                    TableColumn("Status") { StatusCell(action: $0, rebuilding: model.undoing.contains($0.id)) }
-                        .width(min: 70, ideal: 80, max: 100)
-                    TableColumn("") { action in
-                        if !action.undone && !model.undoing.contains(action.id) {
-                            Button("\(action.rebuildVerb)…") { asking = action }
-                                .buttonStyle(.bordered).controlSize(.small)
-                                .accessibilityLabel("\(action.rebuildVerb) \(action.name)")
-                        }
-                    }
-                    .width(min: 90, ideal: 100, max: 120)
+                List(rows) { a in
+                    let busy = model.undoing.contains(a.id)
+                    ItemRow(item: a, note: status(a, busy),
+                            buttons: a.dryRun || a.undone || busy ? [] : [("\(a.rebuildVerb)…", { asking = a })])
                 }
+                .listStyle(.inset(alternatesRowBackgrounds: false))
                 .accessibilityLabel("Deleted folders")
-                .contextMenu(forSelectionType: Candidate.ID.self) { ids in
-                    if let id = ids.first, let action = done.first(where: { $0.id == id }), !action.undone {
-                        Button("\(action.rebuildVerb)…") { asking = action }
-                    }
-                }
-                .tableStyle(.inset(alternatesRowBackgrounds: true))
             }
         }
         .navigationTitle("History")
@@ -85,13 +90,22 @@ struct HistoryView: View {
         }
     }
 
+    private func status(_ a: Candidate, _ busy: Bool) -> String {
+        let when = a.date.map(ago) ?? "at an unknown time"
+        if busy { return "Rebuilding…" }
+        if a.dryRun { return "Dry run: would have been deleted \(when). Nothing was deleted." }
+        return a.undone ? "Deleted \(when), and rebuilt since." : "Deleted \(when)."
+    }
 
+    /// M7: the parts add up to the rows. What is still freed, what was rebuilt, what was inside Docker.
     static func subtitle(_ actions: [Candidate]) -> String {
-        let done = actions.filter { !$0.dryRun }, kept = done.filter { !$0.undone }
+        let done = actions.filter { !$0.dryRun }
         guard !done.isEmpty else { return "" }
-        let rebuilt = done.count - kept.count
-        return "\(bytes(kept.filter(\.freesHost).reduce(0) { $0 + $1.bytes })) freed"
-            + (rebuilt > 0 ? " · \(rebuilt) of \(done.count) rebuilt" : "")
+        let sum = { (rows: [Candidate]) in rows.reduce(Int64(0)) { $0 + $1.bytes } }
+        let freed = sum(done.filter { !$0.undone && $0.freesHost }), rebuilt = sum(done.filter(\.undone))
+        let docker = sum(done.filter { !$0.undone && !$0.freesHost })
+        return ["\(bytes(freed)) still freed", rebuilt > 0 ? "\(bytes(rebuilt)) rebuilt" : nil,
+                docker > 0 ? "\(bytes(docker)) inside Docker" : nil].compactMap { $0 }.joined(separator: " · ")
     }
 
     private func rebuildMessage(_ a: Candidate) -> String {
@@ -100,99 +114,6 @@ struct HistoryView: View {
         text += " It can take a few minutes and may download from the internet."
         if let loss = a.dataLoss { text += " It can't bring back everything: \(loss)." }
         return text
-    }
-}
-
-struct WouldHaveDoneView: View {
-    @EnvironmentObject private var model: AppModel
-    @State private var order: [KeyPathComparator<Candidate>] = [] // the dry run's own order: first to go on top
-
-    var body: some View {
-        let planned = model.actions.filter(\.dryRun)
-        let noBudget = model.status.budgetBytes == 0
-        Group {
-            if planned.isEmpty {
-                EmptyState(symbol: "eye", title: "Nothing to show yet",
-                           detail: noBudget
-                               ? "Set a budget first. For the 7 days after that, this list shows what Headroom would delete."
-                               : "For its first 7 days, this list shows what Headroom would delete.",
-                           action: noBudget ? ("Set a Budget…", openSettings) : nil)
-            } else {
-                Table(planned.sorted(using: order), sortOrder: $order) {
-                    TableColumn("Folder", value: \.name) { FolderCell(action: $0) }.width(min: 160, ideal: 200, max: 220)
-                    TableColumn("Size", value: \.bytes) { SizeCell(bytes: $0.bytes) }
-                        .width(min: 70, ideal: 80, max: 100)
-                    TableColumn("Date Found", value: \.when) { WhenCell(date: $0.date) }
-                        .width(min: 100, ideal: 110, max: 130)
-                }
-                .accessibilityLabel("Folders the dry run would delete")
-                .tableStyle(.inset(alternatesRowBackgrounds: true))
-            }
-        }
-        .navigationTitle("Dry Run")
-        .navigationSubtitle(Self.subtitle(model.actions, dryRun: model.status.dryRun))
-    }
-
-    static func subtitle(_ actions: [Candidate], dryRun: Bool) -> String {
-        let planned = actions.filter(\.dryRun)
-        guard !planned.isEmpty else { return "" }
-        let total = bytes(planned.reduce(0) { $0 + $1.bytes })
-        return dryRun ? "Would free \(total). Nothing has been deleted."
-            : "Ended · would have freed \(total)"
-    }
-}
-
-/// Name on top, what it is and where it lives below.
-struct FolderCell: View {
-    let action: Candidate
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(action.name)
-            HStack(spacing: 0) { // the kind never truncates; the path gives way, in the middle
-                Text(action.what).layoutPriority(1)
-                Text(" · \(action.place)").truncationMode(.middle)
-            }
-            .font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
-        }
-        .padding(.vertical, 4)
-        .help(action.reason ?? "")
-        .accessibilityElement(children: .combine)
-    }
-}
-
-struct StatusCell: View {
-    let action: Candidate
-    let rebuilding: Bool
-
-    var body: some View {
-        if rebuilding {
-            Text("Rebuilding…").foregroundStyle(.secondary)
-        } else if action.undone {
-            Label("Rebuilt", systemImage: "checkmark").foregroundStyle(.secondary)
-        } else {
-            Text("Freed").foregroundStyle(.secondary)
-        }
-    }
-}
-
-struct SizeCell: View {
-    let bytes: Int64
-
-    var body: some View {
-        Text(Headroom.bytes(bytes)).monospacedDigit().frame(maxWidth: .infinity, alignment: .trailing)
-            .accessibilityElement(children: .combine)
-    }
-}
-
-struct WhenCell: View {
-    let date: Date?
-
-    var body: some View {
-        if let date {
-            Text(date, format: .relative(presentation: .named)).foregroundStyle(.secondary)
-                .accessibilityElement(children: .combine)
-        }
     }
 }
 
@@ -253,7 +174,7 @@ struct SettingsView: View {
                     Text("Dry Run")
                 } footer: {
                     Footnote(binding.wrappedValue.dryRun
-                        ? "Nothing is deleted while this is on. It's on for your first 7 days, and what it would delete appears under Dry Run in the Headroom window."
+                        ? "Nothing is deleted while this is on. It's on for your first 7 days, and what it would delete is listed in History."
                         : "Off: Headroom frees space for real, and every deletion appears in History.")
                 }
             } else {

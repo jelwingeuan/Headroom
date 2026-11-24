@@ -234,10 +234,6 @@ struct MenuView: View {
                 LiveLine(checking: model.ticking > 0, last: model.lastCheck)
             }
 
-            if s.dryRun && !planned.isEmpty && mood != .noBudget {
-                WouldDoList(rows: Array(planned.prefix(3)), total: planned.count) { open(.wouldHaveDone) }
-            }
-
             if s.snapshotHolding {
                 Notice(symbol: "clock.badge.exclamationmark",
                        text: "A Time Machine snapshot holds some freed space for up to a day.")
@@ -251,7 +247,7 @@ struct MenuView: View {
             Divider()
             // Real controls, not imitation menu items: a window-style extra gets a footer bar.
             HStack(spacing: 8) {
-                Button("Open Headroom") { open(.insights) }.keyboardShortcut("o")
+                Button("Open Headroom") { open(.overview) }.keyboardShortcut("o")
                 Spacer()
                 // A plain button that opens a real NSMenu: VoiceOver gets a press action, people a menu.
                 Button { showMoreMenu(mood) } label: { Image(systemName: "ellipsis.circle") }
@@ -268,13 +264,8 @@ struct MenuView: View {
             Button("") { openSettings() }.keyboardShortcut(",").opacity(0).accessibilityHidden(true)
             Button("") { NSApp.terminate(nil) }.keyboardShortcut("q").opacity(0).accessibilityHidden(true)
         }
-        .onAppear {
-            model.refresh()
-            model.loadHistory()
-        }
+        .onAppear { model.refresh() }
     }
-
-    private var planned: [Candidate] { model.actions.filter(\.dryRun) }
 
     private func showMoreMenu(_ mood: Mood) {
         let menu = NSMenu()
@@ -404,41 +395,15 @@ struct LiveLine: View {
                 Image(systemName: last.failed ? "exclamationmark.circle" : last.acted ? "checkmark.circle.fill" : "checkmark.circle")
                     .foregroundStyle(last.acted ? Color.headroom : .secondary)
                     .frame(width: 20)
-                Text("\(last.text) · \(last.at.formatted(date: .omitted, time: .shortened))")
-                    .lineLimit(2)
-                    .accessibilityLabel("Last check at \(last.at.formatted(date: .omitted, time: .shortened)): \(last.text)")
+                // M10: "2 minutes ago", never a bare "00:30" that reads like a duration.
+                let when = ago(last.at)
+                Text("\(last.text), \(when)").lineLimit(2)
             }
         }
         .font(.callout)
         .foregroundStyle(.secondary)
         .monospacedDigit()
         .accessibilityElement(children: .combine)
-    }
-}
-
-/// The dry run's picks, so the week shows what autopilot would really do.
-struct WouldDoList: View {
-    let rows: [Candidate]
-    let total: Int
-    let seeAll: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("First to go when the dry run ends").font(.subheadline).foregroundStyle(.secondary)
-            ForEach(rows) { r in
-                HStack {
-                    Text(r.name).lineLimit(1)
-                    Text(r.what).foregroundStyle(.secondary).lineLimit(1)
-                    Spacer()
-                    Text(bytes(r.bytes)).monospacedDigit()
-                }
-                .font(.callout)
-                .accessibilityElement(children: .combine)
-            }
-            if total > rows.count {
-                Button("Show All \(total)…", action: seeAll).buttonStyle(.link).font(.callout)
-            }
-        }
     }
 }
 

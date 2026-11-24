@@ -1,5 +1,6 @@
 import CHeadroom
 import Foundation
+import SwiftUI
 
 typealias JSON = [String: Any]
 
@@ -95,14 +96,15 @@ struct Candidate: Equatable, Identifiable {
     var rebuildSecs: Int64?
     /// breakdown entries: true when autopilot could still reclaim it, false when it's kept.
     var canFree: Bool
+    /// The project it belongs to (git top level, else the marker folder), from breakdown.
+    var project: String?
 
     init(_ j: JSON) {
+        project = j.string("project")
         dataLoss = j.string("data_loss")
         path = j.string("path") ?? ""
         id = j.string("id") ?? j.int("id").map(String.init) ?? path
         kind = j.string("kind") ?? "folder"
-        // shortcut: the history op doesn't pass frees_host on, so it's inferred the way the core
-        // sets it (false only for Docker); read the field once the op returns it.
         freesHost = j.bool("frees_host") ?? !kind.hasPrefix("docker_")
         rebuildSecs = j.int("rebuild_secs")
         canFree = j.bool("free") ?? false
@@ -126,24 +128,19 @@ struct Candidate: Equatable, Identifiable {
         if last == kind { return (place as NSString).lastPathComponent }
         // Xcode names DerivedData folders "<Project>-<28-letter hash>"; people know the project.
         if place.hasSuffix("DerivedData"), let dash = last.lastIndex(of: "-") { return String(last[..<dash]) }
+        if last.hasPrefix("models--") { return last.dropFirst(8).replacingOccurrences(of: "--", with: "/") }
         return last
     }
 
+    var info: Kind { Kind(kind) }
     /// The kind in plain words, for people who don't know the tool's folder names.
-    var what: String {
-        switch kind {
-        case "node_modules": "Node packages"
-        case "target", "rust_target": "Rust build files"
-        case ".next": "Next.js build files"
-        case ".venv", "venv": "Python environment"
-        case "DerivedData", "derived_data": "Xcode build files"
-        case "simulator": "iOS simulator"
-        case "model", "ollama", "hf": "AI model"
-        case "app_cache", "electron_cache": "app cache"
-        case "worktree": "agent worktree"
-        case "docker_images", "docker_build_cache": "Docker images"
-        default: kind.hasPrefix(".") ? String(kind.dropFirst()) + " files" : kind
-        }
+    var what: String { info.label }
+
+    /// The scan's reason split into its clauses, minus the project marker ("Rust project
+    /// (Cargo.toml)") the card already shows: "git ignores it", "last used 41 days ago"…
+    var tags: [String] {
+        let parts = (reason ?? "").components(separatedBy: "; ").filter { !$0.isEmpty }
+        return parts.first?.contains(" project (") == true ? Array(parts.dropFirst()) : parts
     }
 
     /// Undo puts it back by rebuilding: the verb people should see on the button.
@@ -180,5 +177,50 @@ struct Settings: Equatable {
         ["op": "settings_set", "budget_bytes": budgetBytes, "recent_days": recentDays, "dry_run": dryRun]
     }
 }
+
+/// One table for every core kind: its plain name, its Insights group and Overview section, its
+/// color, and why it starts unticked when it does.
+struct Kind {
+    enum Section: Int, CaseIterable, Identifiable {
+        case projects, aiTools, xcode, docker, models
+        var id: Self { self }
+        var title: String {
+            ["Build output in projects", "AI-tool leftovers", "Xcode and simulators", "Docker", "AI models"][rawValue]
+        }
+    }
+
+    var label: String, group: String, section = Section.projects, color = Color.gray
+    /// Set: the Overview shows it unticked, and says this in one sentence.
+    var unticked: String?
+
+    init(_ kind: String) {
+        switch kind {
+        case "node_modules": (label, group, color) = ("Node packages", "Node packages", .green)
+        case "target", "rust_target": (label, group, color) = ("Rust build files", "Rust builds", .orange)
+        case ".next": (label, group) = ("Next.js build files", "Other")
+        case ".venv", "venv": (label, group) = ("Python environment", "Other")
+        case "worktree": (label, group, color) = ("Agent worktree", "Worktrees", .indigo)
+        case "DerivedData", "derived_data": (label, group, section, color) = ("Xcode build files", "Xcode", .xcode, .blue)
+        case "device_support": (label, group, section, color) = ("Device symbols", "Xcode", .xcode, .blue)
+        case "xcode_archive": (label, group, section, color) = ("Xcode archive", "Xcode", .xcode, .blue)
+        case "simulator":
+            (label, group, section, color) = ("iOS simulator", "Xcode", .xcode, .blue)
+            unticked = "Left unticked: its apps and test data can't come back, and Undo gives a blank device."
+        case "model", "ollama", "hf", "ollama_model", "hf_model", "lmstudio_model":
+            (label, group, section, color) = ("AI model", "AI models", .models, .purple)
+        case "claude_code_old": (label, group, section, color) = ("Old Claude Code version", "AI-tool leftovers", .aiTools, .pink)
+        case "codex_temp": (label, group, section, color) = ("Codex temporary files", "AI-tool leftovers", .aiTools, .pink)
+        case "app_cache", "electron_cache": (label, group, section, color) = ("App cache", "AI-tool leftovers", .aiTools, .pink)
+        case "ai_history": (label, group, section, color) = ("AI conversation history", "AI-tool leftovers", .aiTools, .pink)
+        case "docker_images", "docker_build_cache":
+            (label, group, section, color) = (kind == "docker_images" ? "Docker images" : "Docker build cache", "Docker", .docker, .cyan)
+            unticked = "Left unticked: this frees space inside Docker's own disk, not on this Mac's."
+        default: (label, group) = (kind.hasPrefix(".") ? String(kind.dropFirst()) + " files" : kind, "Other")
+        }
+    }
+}
+
+/// "2 hours ago", in English like every other word in the app, whatever the Mac's region.
+func ago(_ d: Date) -> String { d.formatted(.relative(presentation: .named).locale(Locale(identifier: "en"))) }
 
 func bytes(_ n: Int64) -> String { ByteCountFormatter.string(fromByteCount: n, countStyle: .file) }

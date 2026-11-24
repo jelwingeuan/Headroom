@@ -35,8 +35,10 @@ enum Screens {
 
     static func gigs(_ gb: Double) -> Int64 { Int64((gb * 1e9).rounded()) }
 
-    static func entry(_ path: String, _ kind: String, _ gb: Double, _ reason: String, free: Bool = false) -> JSON {
-        ["path": path, "kind": kind, "bytes": gigs(gb), "free": free, "reason": reason]
+    static func entry(_ path: String, _ kind: String, _ gb: Double, _ reason: String, free: Bool = false, project: String? = nil) -> JSON {
+        var e: JSON = ["path": path, "kind": kind, "bytes": gigs(gb), "free": free, "reason": reason, "frees_host": !kind.hasPrefix("docker")]
+        if let project { e["project"] = project }
+        return e
     }
 
     /// What every world's last scan kept: 20 GB listed, plus 1 GB of node_modules too small to list.
@@ -61,30 +63,37 @@ enum Screens {
         entry("/Users/me/Library/Developer/Xcode/DerivedData/Atlas-bxjqk", "DerivedData", 7.4,
               "Xcode build data for /Users/me/code/atlas/Atlas.xcodeproj; last used 38 days ago", free: true),
         entry("/Users/me/code/game/target", "target", 6.3,
-              "Rust project (Cargo.toml); git ignores it; last used 41 days ago; rebuild: cargo build", free: true),
+              "Rust project (Cargo.toml); git ignores it; last used 41 days ago; rebuild: cargo build", free: true, project: "/Users/me/code/game"),
+        entry("/Users/me/code/game/web/node_modules", "node_modules", 0.8,
+              "Node project (package.json); git ignores it; last used 41 days ago; rebuild: npm ci", free: true, project: "/Users/me/code/game"),
         entry("/Users/me/Library/Developer/Xcode/iOS DeviceSupport/iPhone15,2 17.5 (21F79)", "device_support", 5.1,
               "symbols copied from an older device OS", free: true),
         entry("/Users/me/.ollama/models/manifests/registry.ollama.ai/library/llama3.2", "ollama_model", 2.0,
               "Ollama registry model llama3.2; last used 63 days ago", free: true),
         entry("/Users/me/code/blog/node_modules", "node_modules", 0.6,
-              "Node project (package.json); git ignores it; last used 92 days ago; rebuild: npm ci", free: true),
+              "Node project (package.json); git ignores it; last used 92 days ago; rebuild: npm ci", free: true, project: "/Users/me/code/blog"),
         entry("/Users/me/code/site/.next", ".next", 0.4,
-              "Node project (package.json); git ignores it; last used 55 days ago; rebuild: npm run build", free: true),
+              "Node project (package.json); git ignores it; last used 55 days ago; rebuild: npm run build", free: true, project: "/Users/me/code/site"),
+        entry("/Users/me/Library/Developer/CoreSimulator/Devices/9A0B7C21-4D3E-4F5A-8B6C-7D8E9F0A1B2C", "simulator", 1.9,
+              "iPhone 14 simulator; last used 64 days ago; not the newest of its type", free: true),
         entry("/Users/me/.local/share/claude/versions/2.0.14", "claude_code_old", 0.2,
               "an old Claude Code version: not the one ~/.local/bin/claude runs, not the newest", free: true),
     ]
+
+    /// Docker: listed for the Overview, outside every total (its space is inside Docker's disk).
+    static let dockerEntry = entry("docker://build-cache", "docker_build_cache", 3.4, "Docker build cache; unused for 30 days", free: true)
 
     /// A `breakdown` reply: these entries plus `kept`, and per-kind totals that also count the
     /// node_modules too small to be listed.
     static func scan(_ free: [JSON], unlisted: Double) -> JSON {
         var kinds: JSON = ["node_modules": ["free_bytes": gigs(unlisted), "protected_bytes": gigs(1.0)] as JSON]
-        for e in free + kept {
+        for e in free + kept where e.bool("frees_host") == true {
             let key = e.bool("free")! ? "free_bytes" : "protected_bytes"
             var k = kinds.object(e.string("kind")!) ?? ["free_bytes": Int64(0), "protected_bytes": Int64(0)]
             k[key] = k.int(key)! + e.int("bytes")!
             kinds[e.string("kind")!] = k
         }
-        return ["entries": (free + kept).sorted { $0.int("bytes")! > $1.int("bytes")! }, "kinds": kinds,
+        return ["entries": (free + kept + [dockerEntry]).sorted { $0.int("bytes")! > $1.int("bytes")! }, "kinds": kinds,
                 "totals_at": now - 7200]
     }
 
@@ -121,7 +130,7 @@ enum Screens {
         "acting": ["samples": samples(30, free: 57 * GB, budget: 60 * GB, drift: 0.7, rows: done),
                    "breakdown": scan([
                        entry("/Users/me/code/engine/target", "target", 4.8,
-                             "Rust project (Cargo.toml); git ignores it; last used 33 days ago; rebuild: cargo build", free: true),
+                             "Rust project (Cargo.toml); git ignores it; last used 33 days ago; rebuild: cargo build", free: true, project: "/Users/me/code/engine"),
                        entry("/Users/me/Library/Developer/Xcode/iOS DeviceSupport/iPhone15,2 17.5 (21F79)", "device_support", 2.1,
                              "symbols copied from an older device OS", free: true),
                    ] + canFree.suffix(3), unlisted: 0.9),
@@ -138,15 +147,15 @@ enum Screens {
         ("first-run", ["capacity_bytes": 245 * GB, "free_bytes": 18 * GB, "budget_bytes": 0, "dry_run": true, "dry_run_days_left": 7,
                        "permission_errors": 3], [], settings(0, dryRun: true)),
         ("dry-run", ["capacity_bytes": 245 * GB, "free_bytes": 52 * GB, "budget_bytes": 60 * GB, "dry_run": true, "dry_run_days_left": 4,
-                     "next": wouldHave[1], "reclaimable_bytes": 38 * GB, "protected_bytes": 21 * GB,
+                     "next": wouldHave[1], "reclaimable_bytes": gigs(40.7), "protected_bytes": 21 * GB,
                      "protected_by_reason": keptByReason, "totals_at": now - 7200],
          wouldHave, settings(60, dryRun: true)),
         ("plenty", ["capacity_bytes": 245 * GB, "free_bytes": 112 * GB, "budget_bytes": 60 * GB, "dry_run": false,
-                    "reclaimable_bytes": 24 * GB, "protected_bytes": 21 * GB,
+                    "reclaimable_bytes": gigs(26.7), "protected_bytes": 21 * GB,
                     "protected_by_reason": keptByReason, "totals_at": now - 7200],
          done + [docker] + wouldHave, settings(60, dryRun: false)),
         ("acting", ["capacity_bytes": 245 * GB, "free_bytes": 57 * GB, "budget_bytes": 60 * GB, "dry_run": false, "next": done[1],
-                    "snapshot_holding": true, "reclaimable_bytes": 9 * GB, "protected_bytes": 21 * GB,
+                    "snapshot_holding": true, "reclaimable_bytes": gigs(10.3), "protected_bytes": 21 * GB,
                     "protected_by_reason": keptByReason, "totals_at": now - 7200], done, settings(60, dryRun: false)),
         ("error", ["error": "Headroom's core gave no reply. Quit and reopen Headroom."], [], settings(60, dryRun: false)),
     ]
@@ -158,13 +167,21 @@ enum Screens {
 
     static func fixture(_ world: String) -> JSON? {
         guard let (_, status, rows, settings) = worlds.first(where: { $0.0 == world }) else { return nil }
-        return (["status": status, "history": ["actions": rows], "settings_get": settings,
-                 "undo": ["ok": true], "settings_set": settings] as JSON).merging(insights[world] ?? [:]) { $1 }
+        var f = (["status": status, "history": ["actions": rows], "settings_get": settings,
+                  "undo": ["ok": true], "settings_set": settings] as JSON).merging(insights[world] ?? [:]) { $1 }
+        f["rescan"] = f["breakdown"]
+        // The fixtures live in /Users/me; on screen they read as this Mac's home, so ~/… shows.
+        let text = String(data: try! JSONSerialization.data(withJSONObject: f), encoding: .utf8)!
+            .replacingOccurrences(of: "\\/Users\\/me", with: NSHomeDirectory().replacingOccurrences(of: "/", with: "\\/"))
+        f = try! JSONSerialization.jsonObject(with: Data(text.utf8)) as! JSON
+        f["reclaim"] = ["events": [JSON](), "breakdown": f["breakdown"] ?? [:]]
+        return f
     }
 
     static func render(to dir: URL) {
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
+        app.applicationIconImage = NSImage(contentsOfFile: "app/Resources/AppIcon.icns") // no bundle when rendering
         rendering = true
         let failures = selfCheck()
         failures.forEach { print("SELF-CHECK FAIL \($0)") }
@@ -183,15 +200,14 @@ enum Screens {
                       size: nil, appearance, dir.appendingPathComponent("menu-\(world)-\(look).png"))
                 shoot(MenuBarIcon(status: menu.status, paused: false).font(.system(size: 14)).padding(4),
                       size: nil, appearance, dir.appendingPathComponent("icon-\(world)-\(look).png"))
-                guard world == "plenty" || world == "first-run" else { continue }
+                guard world != "error" else { continue }
                 shoot(SettingsView().environmentObject(menu), size: nil, appearance,
                       dir.appendingPathComponent("settings-\(world)-\(look).png"))
                 for pane in Pane.allCases {
                     let model = AppModel(fixture: fixture, pane: pane)
-                    let title = (pane.rawValue, pane == .insights ? "" : pane == .history ? HistoryView.subtitle(model.actions)
-                        : WouldHaveDoneView.subtitle(model.actions, dryRun: model.status.dryRun))
-                    shoot(MainView().environmentObject(model), size: CGSize(width: 800, height: 500), appearance, title: title,
-                          dir.appendingPathComponent("window-\(pane.id.rawValue.lowercased().replacingOccurrences(of: " ", with: "-"))-\(world)-\(look).png"))
+                    let title = (pane.rawValue, pane == .history ? HistoryView.subtitle(model.actions) : "")
+                    shoot(MainView().environmentObject(model), size: CGSize(width: 960, height: 640), appearance, title: title,
+                          dir.appendingPathComponent("window-\(pane.rawValue.lowercased())-\(world)-\(look).png"))
                 }
             }
         }
@@ -259,7 +275,8 @@ enum Screens {
     /// Hosts the view in an offscreen window so AppKit-backed controls (List, Form, Toggle) draw too.
     private static func shoot<V: View>(_ view: V, size: CGSize?, _ appearance: NSAppearance, title: (String, String)? = nil,
                                        _ url: URL) {
-        let controller = NSHostingController(rootView: view)
+        // The app's words are English; its dates and numbers follow them in renders too.
+        let controller = NSHostingController(rootView: view.environment(\.locale, Locale(identifier: "en_US")))
         let fit = size ?? controller.view.fittingSize
         let titled = title != nil
         let style: NSWindow.StyleMask = titled ? [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]

@@ -1,17 +1,18 @@
 import AppKit
+import SwiftUI
 import ServiceManagement
 import UserNotifications
 
 enum Pane: String, CaseIterable, Identifiable {
-    case insights = "Insights"
-    case history = "History"
-    case wouldHaveDone = "Dry Run"
+    case overview = "Overview", insights = "Insights", history = "History", settings = "Settings", about = "About"
     var id: Self { self }
     var symbol: String {
         switch self {
+        case .overview: "internaldrive"
         case .insights: "chart.bar.xaxis"
         case .history: "clock.arrow.circlepath"
-        case .wouldHaveDone: "eye"
+        case .settings: "gearshape"
+        case .about: "info.circle"
         }
     }
 }
@@ -28,7 +29,9 @@ final class AppModel: ObservableObject {
     /// Ticks in flight, and what the last one did: the menu's live line.
     @Published private(set) var ticking = 0
     @Published private(set) var lastCheck: LastCheck?
-    @Published var pane: Pane? = .insights
+    /// A rescan or a delete from the Overview is running.
+    @Published private(set) var working = false
+    @Published var pane: Pane = .overview
     @Published var alert: String?
     @Published var paused = UserDefaults.standard.bool(forKey: "paused") {
         didSet { UserDefaults.standard.set(paused, forKey: "paused") }
@@ -79,13 +82,39 @@ final class AppModel: ObservableObject {
         send(["op": "history"]) { [weak self] reply in
             if let error = reply.error { self?.alert = error; return }
             let items = reply.objects("actions") + reply.objects("items")
-            self?.actions = items.map(Candidate.init)
+            withAnimation(.headroom) { self?.actions = items.map(Candidate.init) } // Undo springs its row back
         }
     }
 
     func loadInsights() {
         send(["op": "samples"]) { [weak self] in self?.samples = $0 }
         send(["op": "breakdown"]) { [weak self] in self?.breakdown = $0 }
+    }
+
+    /// Overview's Rescan: the tick's scan, now.
+    func rescan() {
+        working = true
+        send(["op": "rescan"]) { [weak self] reply in
+            self?.working = false
+            if let error = reply.error { self?.alert = "Couldn't rescan: \(error)"; return }
+            withAnimation(.headroom) { self?.breakdown = reply }
+            self?.refresh()
+        }
+    }
+
+    /// Overview's Delete: the core rechecks every path under every rule before it deletes.
+    func reclaim(_ paths: [String]) {
+        working = true
+        send(["op": "reclaim", "paths": paths]) { [weak self] reply in
+            self?.working = false
+            if let error = reply.error { self?.alert = "Couldn't delete: \(error)"; return }
+            self?.lastCheck = LastCheck(reply)
+            withAnimation(.headroom) {
+                if let b = reply.object("breakdown") { self?.breakdown = b }
+                self?.refresh()
+            }
+            self?.loadHistory()
+        }
     }
 
     func undo(_ action: Candidate) {
@@ -176,6 +205,13 @@ final class AppModel: ObservableObject {
         timer.setEventHandler(handler: work)
         timer.resume()
         return timer
+    }
+}
+
+extension Animation {
+    /// Headroom's one motion: critically damped, no overshoot. With Reduce Motion, a crossfade.
+    static var headroom: Animation {
+        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? .easeInOut(duration: 0.2) : .spring(response: 0.4, dampingFraction: 1)
     }
 }
 

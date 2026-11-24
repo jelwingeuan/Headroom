@@ -16,8 +16,7 @@ struct Insights {
     struct Bar: Identifiable {
         let name: String
         var free: Int64 = 0, kept: Int64 = 0
-        /// The listed folders behind it, largest first. The core lists only the 2,000 largest.
-        var folders: [Candidate] = []
+        var color = Color.gray
         var id: String { name }
         var total: Int64 { free + kept }
     }
@@ -28,6 +27,9 @@ struct Insights {
         var freed: Int64 = 0
         var actions = 0, rebuilt = 0
         var rebuiltBytes: Int64 = 0
+        /// Every delete's size, and the part that was inside Docker's disk: with rebuiltBytes,
+        /// the sum that reconciles `freed` with the rows (M7).
+        var deleted: Int64 = 0, docker: Int64 = 0
         /// nil when no rebuild in the period reported how long it took.
         var rebuildSecs: Int64?
     }
@@ -57,17 +59,13 @@ struct Insights {
 
         var groups: [String: Bar] = [:]
         for (kind, v) in breakdown.object("kinds") ?? [:] {
-            let v = v as? JSON ?? [:], name = Self.group(kind)
-            groups[name, default: Bar(name: name)].free += v.int("free_bytes") ?? 0
+            let v = v as? JSON ?? [:], k = Kind(kind), name = k.group
+            groups[name, default: Bar(name: name, color: k.color)].free += v.int("free_bytes") ?? 0
             groups[name, default: Bar(name: name)].kept += v.int("protected_bytes") ?? 0
         }
         var kept = Dictionary(uniqueKeysWithValues: Self.reasonNames.map {
             ($0.key, Bar(name: $0.name, kept: status.protectedByReason[$0.key] ?? 0))
         })
-        for e in breakdown.objects("entries").map(Candidate.init) {
-            groups[Self.group(e.kind)]?.folders.append(e)
-            if !e.canFree { kept[Self.reasonKey(e.reason ?? "")]?.folders.append(e) }
-        }
         let bySize = { (a: Bar, b: Bar) in (a.total, b.name) > (b.total, a.name) }
         kinds = groups.values.filter { $0.total > 0 }.sorted(by: bySize)
         reasons = kept.values.sorted(by: bySize)
@@ -83,6 +81,17 @@ struct Insights {
         capped = actions.count >= 500
     }
 
+    /// Rises of 10 GB or more within an hour with no Headroom delete in it: space someone else
+    /// freed. Labelled on the chart so a jump never goes unexplained.
+    var jumps: [(at: Date, bytes: Int64)] {
+        zip(samples, samples.dropFirst()).compactMap { a, b in
+            let up = b.free - a.free
+            guard a.run == b.run, up >= 10_000_000_000,
+                  !acted.contains(where: { $0.when > a.at && $0.when <= b.at }) else { return nil }
+            return (b.at, up)
+        }
+    }
+
     /// Free space at `t` on the drawn line, to put an action's point on it.
     func free(at t: Date) -> Int64? {
         guard let i = samples.firstIndex(where: { $0.at >= t }) else { return samples.last?.free }
@@ -93,26 +102,14 @@ struct Insights {
 
     private static func count(_ a: Candidate, into t: inout Tally) {
         t.actions += 1
+        t.deleted += a.bytes
+        if !a.freesHost { t.docker += a.bytes }
         if a.undone {
             t.rebuilt += 1
             if a.freesHost { t.rebuiltBytes += a.bytes }
             if let s = a.rebuildSecs { t.rebuildSecs = (t.rebuildSecs ?? 0) + s }
         } else if a.freesHost {
             t.freed += a.bytes
-        }
-    }
-
-    /// The core's kinds in the plain groups question 2 names. Docker never reaches the
-    /// breakdown (its space stays inside its VM disk), so it has no group.
-    static func group(_ kind: String) -> String {
-        switch kind {
-        case "node_modules": "Node packages"
-        case "target": "Rust builds"
-        case "DerivedData", "device_support", "xcode_archive", "simulator": "Xcode"
-        case "ollama_model", "hf_model", "lmstudio_model": "AI models"
-        case "worktree": "Worktrees"
-        case "claude_code_old", "codex_temp", "electron_cache", "ai_history": "AI-tool leftovers"
-        default: "Other"
         }
     }
 
@@ -124,14 +121,6 @@ struct Insights {
         (key: "other", name: "Other rules", phrase: "folders other safety rules keep"),
     ]
 
-    /// The core's own bucketing of a reason (scan::kept_key), so listed folders land under the
-    /// same bar as the totals.
-    static func reasonKey(_ r: String) -> String {
-        if r.hasPrefix("used ") { return "recent" }
-        if r.hasPrefix("in use") || r.hasSuffix(" is running") || r.contains(" simulator is ")
-            || r.hasPrefix("Xcode is building") || r.contains("may be in use") { return "in_use" }
-        return r.contains("conversation history") ? "history" : "other"
-    }
 }
 
 private func gb(_ b: Int64) -> Double { Double(b) / 1e9 }
@@ -152,14 +141,14 @@ struct InsightsView: View {
 struct InsightsContent: View {
     @EnvironmentObject private var model: AppModel
     @Environment(\.colorSchemeContrast) private var contrast
-    @State private var kind = ""
-    @State private var reason = ""
 
     var body: some View {
         let s = model.status
         let i = Insights(status: s, actions: model.actions, samples: model.samples, breakdown: model.breakdown)
         let measured = "Measured by Headroom's check at \(when(i.totalsAt))."
-        let light = contrast == .increased ? 0.6 : 0.4 // protected's shade of its group's color
+        // Protected is one neutral fill in every bar, never a pale tint of the group's color: it
+        // keeps its contrast in dark mode, and color then only says which group a bar is.
+        let protectedStyle = Color.primary.opacity(contrast == .increased ? 0.45 : 0.3)
         VStack(alignment: .leading, spacing: 20) {
             Question("Am I OK?", okAnswer(s), info: s.freeBytes == nil ? nil
                 : "Free space now comes from macOS, read just now; the budget is the one in Settings. "
@@ -194,15 +183,16 @@ struct InsightsContent: View {
                 if let error = model.breakdown.error {
                     Unavailable(text: error)
                 } else if let bars {
-                    let current = bars.first { $0.name == kind } ?? bars[0]
-                    BarsChart(title: "Space by kind", bars: bars, selected: Binding(get: { current.name }, set: { kind = $0 }),
-                              color: Self.color, keptOpacity: light)
+                    BarsChart(title: "Space by kind", bars: bars, keptStyle: protectedStyle)
                     HStack(spacing: 14) {
-                        Key(text: "Can be freed") { RoundedRectangle(cornerRadius: 2).fill(Color.primary).frame(width: 10, height: 10) }
-                        Key(text: "Protected") { RoundedRectangle(cornerRadius: 2).fill(Color.primary.opacity(light)).frame(width: 10, height: 10) }
+                        Key(text: "Can be freed, in its group's color") {
+                            RoundedRectangle(cornerRadius: 2).fill(LinearGradient(colors: [.green, .orange, .blue], startPoint: .leading, endPoint: .trailing))
+                                .frame(width: 10, height: 10)
+                        }
+                        Key(text: "Protected") { RoundedRectangle(cornerRadius: 2).fill(protectedStyle).frame(width: 10, height: 10) }
+                        Spacer()
+                        Button("Show Folders in Overview") { model.pane = .overview }
                     }
-                    FolderPicker(bars: bars, selection: Binding(get: { current.name }, set: { kind = $0 }))
-                    FolderList(bar: current)
                 } else {
                     Unavailable(text: "Headroom measures this during its checks, at most a day apart. The first one hasn't finished yet.")
                 }
@@ -212,11 +202,9 @@ struct InsightsContent: View {
             Question("Why didn't it clean these?", kept.map { _ in keptAnswer(i, s) },
                      info: "Protected space by the rule that keeps it; a folder kept for several reasons counts once. \(sizeRule) \(measured)") {
                 if let kept {
-                    let current = kept.first { $0.name == reason } ?? kept[0]
-                    BarsChart(title: "Protected space by reason", bars: kept,
-                              selected: Binding(get: { current.name }, set: { reason = $0 }), color: { _ in .gray }, keptOpacity: 1)
-                    FolderPicker(bars: kept, selection: Binding(get: { current.name }, set: { reason = $0 }))
-                    FolderList(bar: current)
+                    BarsChart(title: "Protected space by reason", bars: kept.map { var b = $0; b.color = .secondary; return b },
+                              keptStyle: Color.secondary)
+                    Button("Show Protected Folders in Overview") { model.pane = .overview }
                 } else if s.protectedBytes == 0 {
                     Unavailable(text: "Nothing it found is being kept back.")
                 } else {
@@ -228,25 +216,9 @@ struct InsightsContent: View {
                 if i.total.actions > 0 { Tallies(insights: i) }
             }
 
-            Question("About Headroom", nil) {
-                About(recentDays: model.settings?.recentDays ?? 14)
-            }
         }
         .frame(maxWidth: 760, alignment: .leading)
         .frame(maxWidth: .infinity)
-    }
-
-    /// A system color per group; never teal, which means "Headroom acted".
-    static func color(_ group: String) -> Color {
-        switch group {
-        case "Node packages": .green
-        case "Rust builds": .orange
-        case "Xcode": .blue
-        case "AI models": .purple
-        case "Worktrees": .indigo
-        case "AI-tool leftovers": .pink
-        default: .gray
-        }
     }
 
     private func okAnswer(_ s: Status) -> String {
@@ -403,6 +375,25 @@ struct FreeSpaceChart: View, AXChartDescriptorRepresentable {
                         .foregroundStyle(Color.secondary)
                         .lineStyle(StrokeStyle(lineWidth: 1, dash: [4, 3]))
                 }
+                // M8: nothing on the chart goes unexplained. Jumps Headroom didn't make, the breaks
+                // where the Mac slept, and where the line ends today all carry a label.
+                let jumps = insights.jumps, end = insights.samples.last
+                ForEach(jumps.filter { $0.at != end?.at }, id: \.at) { j in
+                    PointMark(x: .value("Time", j.at), y: .value("Free", grow ? gb(insights.free(at: j.at) ?? 0) : 0))
+                        .symbol(.circle).symbolSize(30).foregroundStyle(Color.primary)
+                        .annotation(position: .top, alignment: .trailing) { Text("You freed \(bytes(j.bytes))").font(.caption) }
+                }
+                ForEach(gaps, id: \.self) { t in
+                    RuleMark(x: .value("Time", t)).foregroundStyle(Color.secondary.opacity(0.4))
+                        .lineStyle(StrokeStyle(lineWidth: 1, dash: [2, 3]))
+                        .annotation(position: .top) { Text("Mac asleep").font(.caption).foregroundStyle(.secondary) }
+                }
+                if let end {
+                    let jump = jumps.first { $0.at == end.at }.map { "You freed \(bytes($0.bytes)) · " } ?? ""
+                    PointMark(x: .value("Time", end.at), y: .value("Free", grow ? gb(end.free) : 0))
+                        .symbolSize(30).foregroundStyle(Color.primary)
+                        .annotation(position: .top, alignment: .trailing) { Text("\(jump)Now \(bytes(end.free))").font(.caption).monospacedDigit() }
+                }
                 ForEach(insights.acted) { a in
                     PointMark(x: .value("Time", a.when), y: .value("Free", grow ? gb(insights.free(at: a.when) ?? 0) : 0))
                         .foregroundStyle(Color.headroom)
@@ -436,6 +427,12 @@ struct FreeSpaceChart: View, AXChartDescriptorRepresentable {
         .accessibilityChartDescriptor(self)
     }
 
+    /// The middle of each break in the line.
+    private var gaps: [Date] {
+        zip(insights.samples, insights.samples.dropFirst()).filter { $0.run != $1.run }
+            .map { $0.at.addingTimeInterval($1.at.timeIntervalSince($0.at) / 2) }
+    }
+
     private var summary: String {
         guard let now = insights.samples.last, let low = insights.samples.min(by: { $0.free < $1.free }) else { return "No data" }
         return "\(bytes(now.free)) free at the latest check. Lowest \(bytes(low.free)), \(low.at.formatted(date: .abbreviated, time: .omitted))."
@@ -460,27 +457,26 @@ struct FreeSpaceChart: View, AXChartDescriptorRepresentable {
     }
 }
 
-/// One horizontal bar per group, largest first: can be freed solid, protected light. Clicking a
-/// bar selects it (its label turns bold); the picker under the chart does the same from the keyboard.
+/// One horizontal bar per group, largest first: can be freed in the group's color, protected in
+/// one neutral gray, and the split written beside it.
 struct BarsChart: View, AXChartDescriptorRepresentable {
     let title: String
     let bars: [Insights.Bar]
-    @Binding var selected: String
-    let color: (String) -> Color
-    let keptOpacity: Double
+    let keptStyle: Color
 
-    private var top: Double { gb(bars.map(\.total).max() ?? 0) * 1.25 }
+    private var top: Double { gb(bars.map(\.total).max() ?? 0) * 1.6 } // room for the words
 
     var body: some View {
         Appear(key: bars.map(\.total)) { grow in
             Chart {
                 ForEach(bars) { b in
                     BarMark(x: .value("Size", grow ? gb(b.free) : 0), y: .value("Group", b.name), height: .ratio(0.6))
-                        .foregroundStyle(color(b.name))
+                        .foregroundStyle(b.color)
                     BarMark(x: .value("Size", grow ? gb(b.kept) : 0), y: .value("Group", b.name), height: .ratio(0.6))
-                        .foregroundStyle(color(b.name).opacity(keptOpacity))
-                        .annotation(position: .trailing) {
-                            Text(bytes(b.total)).font(.caption).monospacedDigit().foregroundStyle(.secondary)
+                        .foregroundStyle(keptStyle)
+                        .annotation(position: .trailing) { // the split in words, so it never rests on color
+                            Text(b.free > 0 && b.kept > 0 ? "\(bytes(b.free)) of \(bytes(b.total)) can be freed" : bytes(b.total))
+                                .font(.caption).monospacedDigit()
                         }
                 }
             }
@@ -488,18 +484,7 @@ struct BarsChart: View, AXChartDescriptorRepresentable {
             .chartXAxis(.hidden)
             .chartYAxis {
                 AxisMarks(position: .leading) { v in
-                    AxisValueLabel {
-                        let name = v.as(String.self) ?? ""
-                        Text(name).fontWeight(name == selected ? .semibold : .regular).foregroundStyle(.primary)
-                    }
-                }
-            }
-            .chartOverlay { proxy in
-                GeometryReader { geo in
-                    Rectangle().fill(.clear).contentShape(Rectangle())
-                        .onTapGesture { p in
-                            if let name: String = proxy.value(atY: p.y - geo[proxy.plotAreaFrame].minY) { selected = name }
-                        }
+                    AxisValueLabel { Text(v.as(String.self) ?? "").foregroundStyle(.primary) }
                 }
             }
             .frame(height: CGFloat(bars.count) * 30)
@@ -524,48 +509,6 @@ struct BarsChart: View, AXChartDescriptorRepresentable {
     }
 }
 
-struct FolderPicker: View {
-    let bars: [Insights.Bar]
-    @Binding var selection: String
-
-    var body: some View {
-        Picker("Folders in", selection: $selection) {
-            ForEach(bars) { Text($0.name).tag($0.name) }
-        }
-        .fixedSize()
-    }
-}
-
-/// The largest listed folders behind one bar: path, size, and the core's reason in one sentence.
-struct FolderList: View {
-    let bar: Insights.Bar
-
-    var body: some View {
-        let shown = bar.folders.prefix(8)
-        let rest = bar.total - shown.reduce(0) { $0 + $1.bytes }
-        VStack(alignment: .leading, spacing: 0) {
-            ForEach(shown) { f in
-                Divider()
-                HStack(alignment: .firstTextBaseline, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(f.shortPath).lineLimit(1).truncationMode(.middle)
-                        (Text(f.canFree ? "Can be freed" : "Protected").fontWeight(.medium) + Text(": \(f.reason ?? "no reason recorded")"))
-                            .font(.subheadline).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-                    }
-                    Spacer(minLength: 0)
-                    Text(bytes(f.bytes)).monospacedDigit()
-                }
-                .padding(.vertical, 6)
-                .accessibilityElement(children: .combine)
-            }
-            if rest > 0 {
-                Divider()
-                Text("Plus \(bytes(rest)) in smaller folders.").font(.subheadline).foregroundStyle(.secondary).padding(.top, 6)
-            }
-        }
-    }
-}
-
 /// Question 4 as a small table: this week against everything History still holds.
 struct Tallies: View {
     let insights: Insights
@@ -573,6 +516,7 @@ struct Tallies: View {
     var body: some View {
         let w = insights.week, t = insights.total
         let period = insights.capped ? "the last 500 actions (History keeps no more)" : "all of History"
+        VStack(alignment: .leading) {
         Grid(alignment: .leading, horizontalSpacing: 28, verticalSpacing: 8) {
             GridRow {
                 Color.clear.frame(width: 1, height: 1)
@@ -591,6 +535,12 @@ struct Tallies: View {
                 info: "Folders brought back with Rebuild, and how long those rebuilds ran, timed while they ran.")
         }
         .monospacedDigit()
+        if t.rebuiltBytes + t.docker > 0 {
+            Text("Of \(bytes(t.deleted)) deleted, \(bytes(t.rebuiltBytes)) was rebuilt since and \(bytes(t.docker)) was inside Docker's disk, "
+                + "so \(bytes(t.freed)) is still free on this Mac.")
+                .font(.subheadline).fixedSize(horizontal: false, vertical: true).padding(.top, 8)
+        }
+        }
     }
 
     private func row(_ label: String, _ week: String, _ total: String, info: String) -> some View {
@@ -625,7 +575,7 @@ struct About: View {
                 rule("clock", "Projects you opened in the last \(recentDays) days are left alone.")
                 rule("hand.raised", "Nothing in use is touched: not a project a program is working in, nor an app's cache while the app runs.")
                 rule("arrow.uturn.backward", "Undo means rebuild: Headroom runs the project's own install or build command again. The one exception is an iOS simulator unused for 30 days, which comes back blank.")
-                rule("eye", "For its first 7 days it only shows what it would delete, under Dry Run.")
+                rule("eye", "For its first 7 days it only lists what it would delete, in History.")
             }
             Text("It never touches your documents or source files, anything git tracks, AI conversation history, Xcode archives or Docker volumes. It has no account and no telemetry, and never goes online itself; only Rebuild runs your package managers, which may download.")
                 .foregroundStyle(.secondary)
