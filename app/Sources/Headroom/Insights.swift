@@ -63,7 +63,7 @@ struct Insights {
             groups[name, default: Bar(name: name, color: k.color)].free += v.int("free_bytes") ?? 0
             groups[name, default: Bar(name: name)].kept += v.int("protected_bytes") ?? 0
         }
-        var kept = Dictionary(uniqueKeysWithValues: Self.reasonNames.map {
+        let kept = Dictionary(uniqueKeysWithValues: Self.reasonNames.map {
             ($0.key, Bar(name: $0.name, kept: status.protectedByReason[$0.key] ?? 0))
         })
         let bySize = { (a: Bar, b: Bar) in (a.total, b.name) > (b.total, a.name) }

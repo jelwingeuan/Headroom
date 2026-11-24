@@ -24,12 +24,15 @@ struct Overview {
     var kept: [Candidate] = []
     /// Ticked when the list first shows: everything freeable except kinds that say why not.
     var defaults: Set<String> = []
+    /// The folder autopilot is deleting right now: shown, never tickable, never counted twice.
+    var freeing: String?
 
-    init(_ breakdown: JSON) {
+    init(_ breakdown: JSON, freeing: String? = nil) {
+        self.freeing = freeing
         let all = breakdown.objects("entries").map(Candidate.init)
         freeable = all.filter(\.canFree)
         kept = all.filter { !$0.canFree }
-        defaults = Set(freeable.filter { $0.info.unticked == nil }.map(\.path))
+        defaults = Set(freeable.filter { $0.info.unticked == nil && $0.path != freeing }.map(\.path))
         for section in Kind.Section.allCases {
             let rows = freeable.filter { $0.section == section }
             guard !rows.isEmpty else { continue }
@@ -57,21 +60,23 @@ struct OverviewView: View {
     @State private var confirming = false
 
     var body: some View {
-        let list = Overview(model.breakdown)
-        let on = ticked ?? list.defaults
-        let chosen = list.freeable.filter { on.contains($0.path) }
-        let total = chosen.reduce(Int64(0)) { $0 + $1.bytes }
         let s = model.status
+        let acting = !s.dryRun && (s.freeBytes ?? 0) < (s.budgetBytes ?? 0)
+        let list = Overview(model.breakdown, freeing: acting ? s.next?.path : nil)
+        let on = ticked ?? list.defaults
+        let chosen = list.freeable.filter { on.contains($0.path) && $0.path != list.freeing }
+        let total = chosen.reduce(Int64(0)) { $0 + $1.bytes }
         List(selection: $selection) {
             Section { Header(list: list, status: s) }
             ForEach(list.groups) { g in
                 Section {
                     ForEach(g.nodes) { n in
                         if let item = n.item {
-                            ItemRow(item: item, tick: tick(item.path, list), note: on.contains(item.path) ? nil : item.info.unticked)
+                            ItemRow(item: item, tick: item.path == list.freeing ? nil : tick(item.path, list), note: note(item, on, list))
                                 .tag(item.path)
                         } else {
-                            ProjectCard(node: n, ticks: n.rows.map { tick($0.path, list) }, on: on).tag(n.id)
+                            ProjectCard(node: n, ticks: n.rows.map { $0.path == list.freeing ? nil : tick($0.path, list) },
+                                        notes: n.rows.map { note($0, on, list) }).tag(n.id)
                         }
                     }
                 } header: {
@@ -111,6 +116,10 @@ struct OverviewView: View {
         .onAppear { model.loadInsights() }
     }
 
+    private func note(_ item: Candidate, _ on: Set<String>, _ list: Overview) -> String? {
+        item.path == list.freeing ? "Headroom is freeing this now." : on.contains(item.path) ? nil : item.info.unticked
+    }
+
     private func tick(_ path: String, _ list: Overview) -> Binding<Bool> {
         Binding(get: { (ticked ?? list.defaults).contains(path) }, set: { on in
             var set = ticked ?? list.defaults
@@ -138,24 +147,30 @@ private struct Header: View {
 
     var body: some View {
         let sum = { (rows: [Candidate]) in rows.reduce(Int64(0)) { $0 + $1.bytes } }
-        let here = sum(list.freeable.filter(\.freesHost)), docker = sum(list.freeable.filter { !$0.freesHost }), kept = sum(list.kept)
+        let host = list.freeable.filter(\.freesHost)
+        let here = sum(host), docker = sum(list.freeable.filter { !$0.freesHost }), kept = sum(list.kept)
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 12) {
                 Text(status.totalsAt == nil ? "Measuring your folders…" : list.freeable.isEmpty ? "Nothing can go right now" : "\(bytes(here)) can go")
                     .font(.largeTitle.weight(.bold)).monospacedDigit()
                 if status.totalsAt == nil || model.working { ProgressView().controlSize(.small) }
             }
-            Text(subline(list.freeable.count, docker, kept)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Text(subline(host.count, docker, kept)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             if let next = status.next, let f = status.freeBytes, let b = status.budgetBytes, f < b, !status.dryRun {
                 // The window says what the menu says: Headroom is working right now.
                 Label("\(bytes(b - f)) below your budget. Freeing \(bytes(next.bytes)) from \(next.name) now.", systemImage: "gauge.badge.minus")
                     .foregroundStyle(Color.headroom)
             }
+            if status.needsFullDiskAccess {
+                Notice(symbol: "lock.shield", text: "Headroom can't see some folders yet, so this list may be short.",
+                       action: ("Full Disk Access Settings…", openFullDiskAccessSettings))
+            }
             if status.budgetBytes == 0 {
                 Button("Set a Budget…") { model.pane = .settings }.buttonStyle(.borderedProminent).tint(.headroom)
             }
             if let f = status.freeBytes, let b = status.budgetBytes {
-                SpaceBar(capacity: status.capacityBytes ?? f, free: f, budget: b, canBeFreed: status.canComeBack).padding(.top, 8)
+                SpaceBar(capacity: status.capacityBytes ?? f, free: f, budget: b, canBeFreed: status.canComeBack,
+                         freeing: !status.dryRun && f < b ? status.next?.bytes ?? 0 : 0).padding(.top, 8)
             }
         }
         .padding(.top, 16)
@@ -166,7 +181,8 @@ private struct Header: View {
         if status.totalsAt == nil {
             return "Headroom's first check lists every folder it could free, and every one it keeps. It takes a minute or two."
         }
-        var parts = [count > 0 ? "\(count) \(count == 1 ? "folder" : "folders")\(docker > 0 ? ", plus \(bytes(docker)) inside Docker" : "")." : nil,
+        var parts = [status.freeBytes.map { f in "\(bytes(f)) free" + ((status.budgetBytes ?? 0) > 0 ? " of the \(bytes(status.budgetBytes!)) you keep." : ".") },
+                     count > 0 ? "\(count) \(count == 1 ? "folder" : "folders")\(docker > 0 ? ", plus \(bytes(docker)) inside Docker" : "")." : nil,
                      kept > 0 ? "\(bytes(kept)) is protected." : nil]
         if let at = status.totalsAt { parts.append("Measured \(ago(at)).") }
         if status.dryRun { parts.append("Dry run: deleting only records what would go.") }
@@ -189,23 +205,27 @@ private struct SectionHeader: View {
 /// A project: one tri-state checkbox for all its folders, then its folders.
 private struct ProjectCard: View {
     let node: Overview.Node
-    let ticks: [Binding<Bool>]
-    let on: Set<String>
+    let ticks: [Binding<Bool>?]
+    let notes: [String?]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
-                Toggle(sources: ticks, isOn: \.self) { EmptyView() }.toggleStyle(.checkbox).labelsHidden()
-                    .accessibilityLabel("All of \(node.title)")
+                if ticks.contains(where: { $0 != nil }) {
+                    Toggle(sources: ticks.compactMap { $0 }, isOn: \.self) { EmptyView() }.toggleStyle(.checkbox).labelsHidden()
+                        .accessibilityLabel("All of \(node.title)")
+                } else { // its only folder is being freed right now
+                    ProgressView().controlSize(.small).frame(width: 16).accessibilityLabel("Freeing")
+                }
                 Text(node.title).font(.headline)
                 Text(node.place).foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
                 Spacer()
                 Text(bytes(node.bytes)).monospacedDigit().font(.headline)
             }
             .frame(minHeight: 32)
-            ForEach(Array(zip(node.rows, ticks)), id: \.0.id) { row, tick in
+            ForEach(node.rows.indices, id: \.self) { i in
                 Divider().padding(.leading, 24)
-                ItemRow(item: row, tick: tick, note: on.contains(row.path) ? nil : row.info.unticked, inCard: true)
+                ItemRow(item: node.rows[i], tick: ticks[i], note: notes[i], inCard: true)
                     .padding(.leading, 24)
             }
         }
@@ -251,15 +271,18 @@ struct ItemRow: View {
                             .font(.subheadline).fixedSize(horizontal: false, vertical: true)
                     } else {
                         Text(note).font(.subheadline).fixedSize(horizontal: false, vertical: true)
+                            .foregroundStyle(item.canFree && tick == nil && item.date == nil ? Color.headroom : .primary) // freeing now
                     }
                 }
             }
             Spacer(minLength: 8)
             Text(bytes(item.bytes)).font(.body.monospacedDigit())
-            ForEach(buttons, id: \.0) { b in Button(b.0, action: b.1).controlSize(.small) }
+            if item.date != nil { // History: one column for its button, so sizes line up
+                HStack { ForEach(buttons, id: \.0) { b in Button(b.0, action: b.1).controlSize(.small) } }.frame(width: 96, alignment: .trailing)
+            }
             Button(action: reveal) { Image(systemName: "magnifyingglass") }
                 .buttonStyle(.borderless).help("Show in Finder")
-                .disabled(!item.path.hasPrefix("/"))
+                .opacity(item.path.hasPrefix("/") ? 1 : 0).disabled(!item.path.hasPrefix("/")) // Docker's folders live inside its disk
         }
         .frame(minHeight: 44)
         .accessibilityElement(children: .ignore)
@@ -306,7 +329,7 @@ private struct BottomBar: View {
                 .contentTransition(.numericText()).animation(.headroom, value: total)
             if working { ProgressView().controlSize(.small).padding(.leading, 4) }
             Spacer()
-            Button(dryRun ? "Would Delete \(bytes(total))…" : "Delete \(bytes(total))…", action: go)
+            Button(dryRun ? "Record \(bytes(total)) in History…" : "Delete \(bytes(total))…", action: go)
                 .buttonStyle(.borderedProminent).tint(.headroom).controlSize(.large)
                 .keyboardShortcut(.defaultAction)
                 .disabled(count == 0 || working)
@@ -327,7 +350,7 @@ struct ConfirmSheet: View {
         let total = rows.reduce(Int64(0)) { $0 + $1.bytes }
         let loss = rows.filter { $0.kind == "simulator" }
         VStack(alignment: .leading, spacing: 12) {
-            Text("\(dryRun ? "Would delete" : "Delete") \(rows.count) \(rows.count == 1 ? "folder" : "folders"), \(bytes(total))\(dryRun ? "" : "?")")
+            Text("\(dryRun ? "Record" : "Delete") \(rows.count) \(rows.count == 1 ? "folder" : "folders"), \(bytes(total))?")
                 .font(.title2.weight(.semibold))
             Text(dryRun ? "It's the dry run week, so nothing is deleted. History lists these as what Headroom would delete."
                  : "Headroom checks each folder again just before deleting it. Each one is listed in History, where one click brings it back: Rebuild runs its install or build again, and Download Again fetches a model. \(rebuildTime).")
@@ -336,7 +359,7 @@ struct ConfirmSheet: View {
                 let shown = rows.count > 8 ? Array(rows.prefix(7)) : rows
                 ForEach(shown) { r in
                     HStack {
-                        Text(r.name).font(.body.monospaced()).lineLimit(1)
+                        Text(r.project.map { "\(($0 as NSString).lastPathComponent) › \(r.inProject)" } ?? r.name).font(.body.monospaced()).lineLimit(1)
                         Text(r.what).foregroundStyle(.secondary).lineLimit(1)
                         Spacer()
                         Text(bytes(r.bytes)).monospacedDigit()

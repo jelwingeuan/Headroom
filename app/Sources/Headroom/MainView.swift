@@ -32,7 +32,14 @@ struct MainView: View {
             case .insights: InsightsView()
             case .history: HistoryView()
             case .settings: SettingsView().frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top).navigationTitle("Settings")
-            case .about: ScrollView { About(recentDays: model.settings?.recentDays ?? 14).padding(24).frame(maxWidth: 640, alignment: .leading) }
+            case .about: ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    Text("How Headroom decides").font(.title.weight(.bold))
+                    About(recentDays: model.settings?.recentDays ?? 14)
+                    Text("\(version) · MIT License · No account, no telemetry").font(.caption).foregroundStyle(.secondary)
+                }
+                .padding(24).frame(maxWidth: 640, alignment: .leading)
+            }
                 .navigationTitle("About Headroom")
             }
         }
@@ -70,11 +77,12 @@ struct HistoryView: View {
                            action: model.status.budgetBytes == 0 ? ("Set a Budget…", { model.pane = .settings }) : nil)
             } else {
                 List {
-                    Text(Self.subtitle(model.actions)).font(.title3).monospacedDigit().padding(.vertical, 8) // M7: the parts add up
+                    Text(Self.subtitle(model.actions).isEmpty ? "Nothing deleted. \(bytes(rows.filter(\.dryRun).reduce(0) { $0 + $1.bytes })) would have gone in the dry run."
+                         : Self.subtitle(model.actions)).font(.title3).monospacedDigit().padding(.vertical, 8) // M7: the parts add up
                     ForEach(rows) { a in
                     let busy = model.undoing.contains(a.id)
                     ItemRow(item: a, note: status(a, busy),
-                            buttons: a.dryRun || a.undone || busy ? [] : [("\(a.rebuildVerb)…", { asking = a })])
+                            buttons: a.dryRun || a.undone || busy || !a.freesHost ? [] : [("\(a.rebuildVerb)…", { asking = a })])
                     }
                 }
                 .listStyle(.inset(alternatesRowBackgrounds: false))
@@ -156,13 +164,13 @@ struct SettingsView: View {
                             Text("GB free")
                         }
                     }
-                    Picker("Leave projects alone for (days)", selection: binding.recentDays) {
-                        ForEach([7, 14, 30, 60, 90], id: \.self) { Text("\($0)").tag($0) }
+                    Picker("Leave projects alone for", selection: binding.recentDays) {
+                        ForEach([7, 14, 30, 60, 90], id: \.self) { Text("\($0) days").tag($0) }
                         if ![7, 14, 30, 60, 90].contains(binding.wrappedValue.recentDays) {
                             Text("\(binding.wrappedValue.recentDays) days").tag(binding.wrappedValue.recentDays)
                         }
                     }
-                    .pickerStyle(.segmented)
+                    .pickerStyle(.menu)
                 } header: {
                     Text("Free Space")
                 } footer: {

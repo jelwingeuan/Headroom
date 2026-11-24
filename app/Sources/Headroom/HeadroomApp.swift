@@ -134,7 +134,7 @@ struct SpaceBar: View {
                         .frame(maxWidth: .infinity, alignment: .trailing)
                         .opacity(budget > 0 && at > geo.size.width - 210 ? 0 : 1)
                     if budget > 0 { // the label's tick sits exactly under the marker, flipped near the right end
-                        let flip = at > geo.size.width - 130
+                        let flip = at > 130 // always left of the marker when it fits, the same in the menu and the window
                         Label("\(bytes(budget)) budget", systemImage: "line.diagonal").labelStyle(BudgetLabelStyle(tickTrailing: flip))
                             .fixedSize()
                             .frame(maxWidth: .infinity, alignment: flip ? .trailing : .leading)
@@ -394,7 +394,7 @@ struct LiveLine: View {
         HStack(spacing: 8) {
             if checking {
                 ProgressView().controlSize(.small).frame(width: 20)
-                Text("Checking your disk…")
+                Text("Measuring your folders…")
             } else if let last {
                 Image(systemName: last.failed ? "exclamationmark.circle" : last.acted ? "checkmark.circle.fill" : "checkmark.circle")
                     .foregroundStyle(last.acted ? Color.headroom : .secondary)

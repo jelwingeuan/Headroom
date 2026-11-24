@@ -9,29 +9,35 @@ enum Screens {
     /// Set while rendering: charts start in place, so a still shows them whole.
     static var rendering = false
 
-    static func row(_ id: String, _ path: String, _ kind: String, _ gb: Double, daysAgo: Double,
+    /// A History row; `used` matches the Overview's "last used" for the same folder.
+    static func row(_ id: String, _ path: String, _ kind: String, _ gb: Double, daysAgo: Double, used: Int,
                     dryRun: Bool = false, undone: Bool = false, rebuild: String? = nil) -> JSON {
+        let git = Kind(kind).section == .projects ? "git ignores it; " : ""
         var r: JSON = ["id": id, "path": path, "kind": kind, "bytes": Int64(gb * 1e9),
                        "at": now - Int64(daysAgo * 86_400), "dry_run": dryRun, "undone": undone,
-                       "reason": "git ignores it; last used \(30 + Int(daysAgo)) days ago"]
+                       "reason": "\(git)last used \(used) days ago"]
         if let rebuild { r["rebuild"] = rebuild }
         return r
     }
 
     static let done = [
-        row("1", "/Users/me/code/shop/node_modules", "node_modules", 1.2, daysAgo: 0.2, rebuild: "npm ci"),
-        row("2", "/Users/me/code/engine/target", "target", 4.8, daysAgo: 1, rebuild: "cargo build"),
-        row("3", "/Users/me/Library/Developer/Xcode/DerivedData/Atlas-bxjqk", "DerivedData", 2.1, daysAgo: 3,
+        row("1", "/Users/me/code/shop/node_modules", "node_modules", 1.2, daysAgo: 0.0006, used: 40, rebuild: "npm ci"),
+        row("2", "/Users/me/code/engine/target", "target", 4.8, daysAgo: 1, used: 33, rebuild: "cargo build"),
+        row("3", "/Users/me/Library/Developer/Xcode/DerivedData/Atlas-bxjqk", "DerivedData", 2.1, daysAgo: 3, used: 38,
             undone: true, rebuild: "xcodebuild").merging(["rebuild_secs": 184]) { $1 },
-        row("4", "/Users/me/code/ml/.venv", ".venv", 0.9, daysAgo: 6, rebuild: "pip install -r requirements.txt"),
+        row("4", "/Users/me/code/ml/.venv", ".venv", 0.9, daysAgo: 6, used: 51, rebuild: "pip install -r requirements.txt"),
     ]
     static let wouldHave = [
-        row("d1", "/Users/me/code/blog/node_modules", "node_modules", 0.6, daysAgo: 0, dryRun: true),
-        row("d2", "/Users/me/code/game/target", "target", 6.3, daysAgo: 1, dryRun: true),
-        row("d3", "/Users/me/.ollama/models/llama3.2", "model", 2.0, daysAgo: 2, dryRun: true),
+        row("d1", "/Users/me/code/blog/node_modules", "node_modules", 0.6, daysAgo: 0.0006, used: 92, dryRun: true),
+        row("d2", "/Users/me/code/game/target", "target", 6.3, daysAgo: 0.0006, used: 41, dryRun: true),
+        row("d3", "/Users/me/.ollama/models/manifests/registry.ollama.ai/library/llama3.2", "ollama_model", 2.0, daysAgo: 2, used: 63, dryRun: true),
     ]
+    /// The same dry-run rows from the trial week, which ended before the plenty world's deletes.
+    static let wouldHaveOld = wouldHave.map { r -> JSON in var r = r; r["at"] = r.int("at")! - 9 * 86_400; return r }
+    /// The acting world: everything but engine, which it is freeing now.
+    static let doneBeforeEngine = done.filter { $0.string("id") != "2" }
     /// Docker's space stays inside its VM disk: a real action that frees nothing on this disk.
-    static let docker = row("5", "docker://build-cache", "docker_build_cache", 3.0, daysAgo: 2)
+    static let docker = row("5", "docker://build-cache", "docker_build_cache", 3.0, daysAgo: 2, used: 30)
 
     static func gigs(_ gb: Double) -> Int64 { Int64((gb * 1e9).rounded()) }
 
@@ -127,7 +133,7 @@ enum Screens {
                     "tick": ["events": [reclaimed(wouldHave[1], event: "would_reclaim")]]],
         "plenty": ["samples": samples(30, free: 112 * GB, budget: 60 * GB, drift: 1.6, rows: done, jump: (0.1, 55)),
                    "breakdown": scan(Array(canFree.dropFirst()), unlisted: 0), "tick": ["events": [JSON]()]],
-        "acting": ["samples": samples(30, free: 57 * GB, budget: 60 * GB, drift: 0.7, rows: done),
+        "acting": ["samples": samples(30, free: 57 * GB, budget: 60 * GB, drift: 0.7, rows: doneBeforeEngine),
                    "breakdown": scan([
                        entry("/Users/me/code/engine/target", "target", 4.8,
                              "Rust project (Cargo.toml); git ignores it; last used 33 days ago; rebuild: cargo build", free: true, project: "/Users/me/code/engine"),
@@ -153,10 +159,10 @@ enum Screens {
         ("plenty", ["capacity_bytes": 245 * GB, "free_bytes": 112 * GB, "budget_bytes": 60 * GB, "dry_run": false,
                     "reclaimable_bytes": gigs(24.7), "protected_bytes": 20 * GB,
                     "protected_by_reason": keptByReason, "totals_at": now - 7200],
-         done + [docker] + wouldHave, settings(60, dryRun: false)),
+         done + [docker] + wouldHaveOld, settings(60, dryRun: false)),
         ("acting", ["capacity_bytes": 245 * GB, "free_bytes": 57 * GB, "budget_bytes": 60 * GB, "dry_run": false, "next": done[1],
                     "snapshot_holding": true, "reclaimable_bytes": gigs(9.4), "protected_bytes": 20 * GB,
-                    "protected_by_reason": keptByReason, "totals_at": now - 7200], done, settings(60, dryRun: false)),
+                    "protected_by_reason": keptByReason, "totals_at": now - 7200], doneBeforeEngine, settings(60, dryRun: false)),
         ("error", ["error": "Headroom's core gave no reply. Quit and reopen Headroom."], [], settings(60, dryRun: false)),
     ]
 
@@ -277,7 +283,7 @@ enum Screens {
         let busy: JSON = ["event": "skip", "path": "/Users/me/code/shop/node_modules", "kind": "node_modules",
                           "reason": "in use: node is working in /Users/me/code/shop"]
         expect(line([busy]) == "Waiting: shop is in use", "live line: \(line([busy]))")
-        expect(line([["event": "tick"]]) == "Nothing to do", "live line: \(line([["event": "tick"]]))")
+        expect(line([["event": "tick"]]) == "Checked, nothing needed", "live line: \(line([["event": "tick"]]))")
         return failures
     }
 
