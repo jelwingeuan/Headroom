@@ -67,7 +67,7 @@ Cheap: one `statvfs` and a few small files, no scan. Call it as often as needed.
 ```
 Newest first, at most 500. `dry_run: true` rows are what the dry run would have reclaimed
 (the "Would Have Done" list); they can't be undone because nothing was deleted. `origin` is
-`clean`, `autopilot`, `mcp` or `archive`. `data_loss` (when present) says what undo can't
+`clean`, `autopilot`, `mcp` or `archive`. `frees_host` (false for Docker), `undone_at` and `rebuild_secs` (seconds the rebuild took) come from the history file. `data_loss` (when present) says what undo can't
 bring back: a simulator's apps and test data. `partial: true` marks a delete that failed
 midway; undo rebuilds over what was left.
 

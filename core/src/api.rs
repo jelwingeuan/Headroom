@@ -65,6 +65,8 @@ fn history(ctx: &Ctx) -> Json {
                 "at" => a.get("at").cloned(), "origin" => a.s("origin"), "reason" => a.s("why"),
                 "data_loss" => a.get("data_loss").cloned(), "partial" => a.get("partial").cloned(),
                 "undone" => a.get("undone").and_then(Json::bool).unwrap_or(false), "dry_run" => false,
+                "frees_host" => a.get("frees_host").and_then(Json::bool).unwrap_or(true),
+                "undone_at" => a.get("undone_at").cloned(), "rebuild_secs" => a.get("rebuild_secs").cloned(),
                 "rebuild" => a.get("steps").map(|s| s.arr().iter().map(|x| x.arr().iter().filter_map(Json::str).collect::<Vec<_>>().join(" ")).collect::<Vec<_>>().join(" && ")),
             }
         })
@@ -377,7 +379,8 @@ mod tests {
         let ctx = crate::testutil::ctx("api-history");
         state::record(
             &ctx,
-            obj! {"at" => 10, "path" => "/x/node_modules", "kind" => "node_modules", "bytes" => 5, "undone" => false},
+            obj! {"at" => 10, "path" => "/x/node_modules", "kind" => "node_modules", "bytes" => 5, "undone" => true,
+            "undone_at" => 30, "rebuild_secs" => 184, "frees_host" => false},
         );
         state::log_dry_run(
             &ctx,
@@ -386,6 +389,11 @@ mod tests {
         let h = history(&ctx);
         let rows = h.get("actions").unwrap().arr();
         assert_eq!(rows.len(), 2);
+        // What Insights needs: rebuild time, when it was rebuilt, and whether the space was on this disk.
+        let done = rows.iter().find(|r| r.s("path") == "/x/node_modules").unwrap();
+        assert_eq!(done.get("rebuild_secs").and_then(Json::u64), Some(184));
+        assert_eq!(done.get("undone_at").and_then(Json::u64), Some(30));
+        assert_eq!(done.get("frees_host").and_then(Json::bool), Some(false));
         assert_eq!(rows[0].get("dry_run"), Some(&Json::Bool(true)));
         assert!(undo(&ctx, &obj! {"id" => rows[0].s("id")}).get("error").is_some());
         assert!(undo(&ctx, &obj! {"id" => "nope"}).get("error").is_some());
