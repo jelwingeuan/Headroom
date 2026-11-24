@@ -144,18 +144,20 @@ fn scan_home(ctx: &Ctx) -> Result<scan::Scan, String> {
 fn measure(st: &mut Json, s: &scan::Scan, gone: &[PathBuf], now: u64) -> Json {
     st.set("permission_errors", s.denied);
     let mut list = kept(&s.cands);
-    let free = s.cands.iter().filter(|c| c.reclaimable() && c.frees_host && !gone.contains(&c.path));
+    let free = s.cands.iter().filter(|c| c.reclaimable() && !gone.contains(&c.path));
     list.extend(free.map(Measured::free));
     st.set("totals", totals(&list, now));
     last_scan(list, now)
 }
 
-/// One folder a tick's totals count: `free` when autopilot could still reclaim it.
+/// One folder a scan measured: `free` when it may go. Only what `frees_host` counts in the
+/// totals: Docker may go, but its space stays inside its VM disk.
 struct Measured {
     path: PathBuf,
     kind: String,
     bytes: u64,
     free: bool,
+    frees_host: bool,
     reason: String,
     project: Option<PathBuf>,
 }
@@ -167,6 +169,7 @@ impl Measured {
             kind: c.kind.clone(),
             bytes: c.bytes,
             free: true,
+            frees_host: c.frees_host,
             reason: c.reason().into(),
             project: c.project.clone(),
         }
@@ -195,6 +198,7 @@ fn kept(cands: &[Cand]) -> Vec<Measured> {
             kind: k.kind.clone(),
             bytes,
             free: false,
+            frees_host: k.frees_host,
             reason: reason.into(),
             project: k.project.clone(),
         });
@@ -204,21 +208,22 @@ fn kept(cands: &[Cand]) -> Vec<Measured> {
 
 /// The totals `status` reports, as kept in state.
 fn totals(list: &[Measured], at: u64) -> Json {
+    let counted = || list.iter().filter(|m| m.frees_host);
     let mut by = obj! {"recent" => 0u64, "in_use" => 0u64, "history" => 0u64, "other" => 0u64};
-    for m in list.iter().filter(|m| !m.free) {
+    for m in counted().filter(|m| !m.free) {
         let key = scan::kept_key(&m.reason);
         let now = by.get(key).and_then(Json::u64).unwrap_or(0);
         by.set(key, now + m.bytes);
     }
-    let sum = |free: bool| list.iter().filter(|m| m.free == free).map(|m| m.bytes).sum::<u64>();
+    let sum = |free: bool| counted().filter(|m| m.free == free).map(|m| m.bytes).sum::<u64>();
     obj! {"reclaimable_bytes" => sum(true), "protected_bytes" => sum(false), "protected_by_reason" => by, "at" => at}
 }
 
-/// last-scan.json, the list behind the totals: per-kind totals over all of it, and its 2,000
-/// largest entries.
+/// last-scan.json, the list behind the totals: per-kind totals over what they count, and its
+/// 2,000 largest entries.
 fn last_scan(mut list: Vec<Measured>, at: u64) -> Json {
     let mut by: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
-    for m in &list {
+    for m in list.iter().filter(|m| m.frees_host) {
         let k = by.entry(&m.kind).or_default();
         if m.free {
             k.0 += m.bytes;
@@ -233,7 +238,7 @@ fn last_scan(mut list: Vec<Measured>, at: u64) -> Json {
     let entries: Vec<Json> = list
         .iter()
         .map(|m| {
-            obj! {"path" => &m.path, "kind" => &m.kind, "bytes" => m.bytes, "free" => m.free, "reason" => &m.reason, "project" => m.project.as_ref()}
+            obj! {"path" => &m.path, "kind" => &m.kind, "bytes" => m.bytes, "free" => m.free, "frees_host" => m.frees_host, "reason" => &m.reason, "project" => m.project.as_ref()}
         })
         .collect();
     obj! {"entries" => entries, "kinds" => kinds, "totals_at" => at}
@@ -357,6 +362,7 @@ mod tests {
                 kind: kind(i).into(),
                 bytes: i,
                 free: i % 3 == 0,
+                frees_host: true,
                 reason: String::new(),
                 project: None,
             })

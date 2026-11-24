@@ -320,7 +320,9 @@ mod tests {
             for k in ["entries", "kinds", "totals_at"] {
                 assert_eq!(b.get(k), Some(&Json::Null), "{k} before any tick");
             }
-            crate::autopilot::tick(&c, budget, &mut |_| {});
+            let mut ev = vec![];
+            crate::autopilot::tick(&c, budget, &mut |e| ev.push(e));
+            assert!(ev.iter().all(|e| !e.s("kind").starts_with("docker_")), "autopilot leaves Docker alone: {ev:?}");
             let before = scans();
             let (s, b, rows) = (status(&c), breakdown(&c), samples(&c));
             assert_eq!(scans(), before, "status, breakdown and samples never scan");
@@ -328,9 +330,10 @@ mod tests {
             assert_eq!((n(row, "at"), n(row, "budget")), (c.now, budget));
             assert!(n(row, "free") > 0);
 
-            // The per-kind totals are exactly the status totals.
+            // The per-kind totals are exactly the status totals, and leave Docker out.
             assert_eq!(b.get("totals_at"), s.get("totals_at"));
             let Some(Json::Obj(kinds)) = b.get("kinds") else { panic!("{b}") };
+            assert!(kinds.iter().all(|(k, _)| !k.starts_with("docker_")), "{b}");
             let sum = |k: &str| kinds.iter().map(|(_, t)| n(t, k)).sum::<u64>();
             assert_eq!(sum("free_bytes"), n(&s, "reclaimable_bytes"), "{b}");
             assert_eq!(sum("protected_bytes"), n(&s, "protected_bytes"), "{b}");
@@ -342,22 +345,22 @@ mod tests {
                 crate::scan::scan(&c, &c.home).unwrap().cands.iter().map(crate::scan::Cand::to_json).collect();
             assert!(listed.iter().any(|e| e.s("kind") == "docker_build_cache"), "the fake docker was seen");
             for e in &listed {
-                let found = entries.iter().find(|x| x.s("path") == e.s("path"));
-                if e.s("kind").starts_with("docker_") {
-                    assert!(found.is_none(), "Docker frees nothing on this volume: {e}");
-                } else if e.get("reclaimable") == Some(&Json::Bool(true)) {
-                    let f = found.unwrap_or_else(|| panic!("{e} missing from {b}"));
+                let f = entries
+                    .iter()
+                    .find(|x| x.s("path") == e.s("path"))
+                    .unwrap_or_else(|| panic!("{e} missing from {b}"));
+                assert_eq!(f.get("project"), e.get("project"), "{f}");
+                // Docker may go, but frees nothing on this volume.
+                assert_eq!(f.get("frees_host"), Some(&Json::Bool(!e.s("kind").starts_with("docker_"))), "{f}");
+                if e.get("reclaimable") == Some(&Json::Bool(true)) {
                     assert_eq!(f.get("free"), Some(&Json::Bool(true)), "{f}");
                     assert_eq!((f.get("bytes"), f.s("reason")), (e.get("bytes"), e.s("reason")), "{f}");
-                    assert_eq!(f.get("project"), e.get("project"), "{f}");
                 } else {
                     // Kept: by path only, since `scan` leaves kept folders unsized (a speed choice).
-                    let f = found.unwrap_or_else(|| panic!("{e} missing from {b}"));
                     assert_eq!(f.get("free"), Some(&Json::Bool(false)), "{f}");
-                    assert_eq!(f.get("project"), e.get("project"), "{f}");
                 }
             }
-            assert_eq!(entries.len(), listed.len() - 1, "nothing listed that scan doesn't list");
+            assert_eq!(entries.len(), listed.len(), "nothing listed that scan doesn't list");
             for name in ["cold", "recent"] {
                 let p = c.home.join("code").join(name);
                 let e = entries.iter().find(|x| x.s("path") == p.join("node_modules").to_string_lossy()).unwrap();
