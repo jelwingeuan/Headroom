@@ -152,6 +152,30 @@ pub fn rescan(ctx: &Ctx) -> Result<Json, String> {
     Ok(save_measured(ctx, &s, &[]))
 }
 
+/// The `reclaim` op: one scan of home, then each of `paths` that this scan found and says may
+/// go (Docker too: the user picked it) through `reclaim_one`, dry run included, as a tick does.
+/// Then the totals and last-scan.json of that scan are saved without what was reclaimed.
+/// Returns the new last-scan.json.
+pub fn reclaim_picked(ctx: &Ctx, paths: &[PathBuf], emit: &mut dyn FnMut(Json)) -> Result<Json, String> {
+    let (dry, _) = state::dry_run(ctx);
+    let s = scan_home(ctx)?;
+    let mut gone = vec![];
+    for p in paths {
+        match s.cands.iter().find(|c| c.path == *p) {
+            None => emit(obj! {"event" => "skip", "path" => p, "reason" => "not found in the latest scan"}),
+            Some(c) if !c.reclaimable() => {
+                emit(obj! {"event" => "skip", "path" => &c.path, "kind" => &c.kind, "reason" => c.reason()})
+            }
+            Some(c) => {
+                if reclaim_one(ctx, c, dry, "manual", emit).is_some() && !dry {
+                    gone.push(c.path.clone());
+                }
+            }
+        }
+    }
+    Ok(save_measured(ctx, &s, &gone))
+}
+
 /// Saves the totals and last-scan.json of a scan made outside a tick (the rest of the
 /// autopilot memory stays as it is) and returns last-scan.json.
 fn save_measured(ctx: &Ctx, s: &scan::Scan, gone: &[PathBuf]) -> Json {
