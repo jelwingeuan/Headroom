@@ -63,7 +63,6 @@ struct MenuBarIcon: View {
             .accessibilityValue(label(mood))
     }
 
-
     private func label(_ m: Mood) -> String {
         switch m {
         case .unknown: "measuring free space"
@@ -365,10 +364,7 @@ struct Notice: View {
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Group {
-                Image(systemName: symbol)
-            }
-            .foregroundStyle(tint)
+            Image(systemName: symbol).foregroundStyle(tint)
             .frame(width: 20)
             VStack(alignment: .leading, spacing: 8) {
                 Text(text).fixedSize(horizontal: false, vertical: true)

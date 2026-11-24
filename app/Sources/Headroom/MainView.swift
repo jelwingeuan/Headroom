@@ -58,9 +58,7 @@ struct MainView: View {
         }
     }
 
-    private var version: String {
-        (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String).map { "Version \($0)" } ?? "Development build"
-    }
+    private var version: String { (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String).map { "Version \($0)" } ?? "Development build" }
 }
 
 /// Every delete, newest first, on the Overview's own row. A dry-run row says what would have gone.

@@ -166,10 +166,8 @@ enum Screens {
         ("error", ["error": "Headroom's core gave no reply. Quit and reopen Headroom."], [], settings(60, dryRun: false)),
     ]
 
-    static let looks: [(String, NSAppearance.Name)] = [
-        ("light", .aqua), ("dark", .darkAqua),
-        ("light-contrast", .accessibilityHighContrastAqua), ("dark-contrast", .accessibilityHighContrastDarkAqua),
-    ]
+    /// Increase Contrast renders came out pixel-identical offscreen, so only these two are drawn.
+    static let looks: [(String, NSAppearance.Name)] = [("light", .aqua), ("dark", .darkAqua)]
 
     static func fixture(_ world: String) -> JSON? {
         guard let (_, status, rows, settings) = worlds.first(where: { $0.0 == world }) else { return nil }
@@ -207,8 +205,6 @@ enum Screens {
                 shoot(MenuBarIcon(status: menu.status, paused: false).font(.system(size: 14)).padding(4),
                       size: nil, appearance, dir.appendingPathComponent("icon-\(world)-\(look).png"))
                 guard world != "error" else { continue }
-                shoot(SettingsView().environmentObject(menu), size: nil, appearance,
-                      dir.appendingPathComponent("settings-\(world)-\(look).png"))
                 // The whole Overview list, Protected open, and the sheet its button opens.
                 let overview = AppModel(fixture: fixture, pane: .overview)
                 shoot(OverviewView().environmentObject(overview), size: CGSize(width: 760, height: 1900), appearance,
