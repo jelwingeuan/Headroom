@@ -349,13 +349,20 @@ mod tests {
                     let f = found.unwrap_or_else(|| panic!("{e} missing from {b}"));
                     assert_eq!(f.get("free"), Some(&Json::Bool(true)), "{f}");
                     assert_eq!((f.get("bytes"), f.s("reason")), (e.get("bytes"), e.s("reason")), "{f}");
+                    assert_eq!(f.get("project"), e.get("project"), "{f}");
                 } else {
                     // Kept: by path only, since `scan` leaves kept folders unsized (a speed choice).
                     let f = found.unwrap_or_else(|| panic!("{e} missing from {b}"));
                     assert_eq!(f.get("free"), Some(&Json::Bool(false)), "{f}");
+                    assert_eq!(f.get("project"), e.get("project"), "{f}");
                 }
             }
             assert_eq!(entries.len(), listed.len() - 1, "nothing listed that scan doesn't list");
+            for name in ["cold", "recent"] {
+                let p = c.home.join("code").join(name);
+                let e = entries.iter().find(|x| x.s("path") == p.join("node_modules").to_string_lossy()).unwrap();
+                assert_eq!(e.s("project"), p.to_string_lossy(), "{e}");
+            }
         }
     }
 

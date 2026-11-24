@@ -150,11 +150,19 @@ struct Measured {
     bytes: u64,
     free: bool,
     reason: String,
+    project: Option<PathBuf>,
 }
 
 impl Measured {
     fn free(c: &Cand) -> Measured {
-        Measured { path: c.path.clone(), kind: c.kind.clone(), bytes: c.bytes, free: true, reason: c.reason().into() }
+        Measured {
+            path: c.path.clone(),
+            kind: c.kind.clone(),
+            bytes: c.bytes,
+            free: true,
+            reason: c.reason().into(),
+            project: c.project.clone(),
+        }
     }
 }
 
@@ -175,7 +183,14 @@ fn kept(cands: &[Cand]) -> Vec<Measured> {
             .map(|o| o.bytes)
             .sum();
         let bytes = k.bytes.saturating_sub(inner);
-        out.push(Measured { path: k.path.clone(), kind: k.kind.clone(), bytes, free: false, reason: reason.into() });
+        out.push(Measured {
+            path: k.path.clone(),
+            kind: k.kind.clone(),
+            bytes,
+            free: false,
+            reason: reason.into(),
+            project: k.project.clone(),
+        });
     }
     out
 }
@@ -210,7 +225,9 @@ fn last_scan(mut list: Vec<Measured>, at: u64) -> Json {
     list.truncate(2000);
     let entries: Vec<Json> = list
         .iter()
-        .map(|m| obj! {"path" => &m.path, "kind" => &m.kind, "bytes" => m.bytes, "free" => m.free, "reason" => &m.reason})
+        .map(|m| {
+            obj! {"path" => &m.path, "kind" => &m.kind, "bytes" => m.bytes, "free" => m.free, "reason" => &m.reason, "project" => m.project.as_ref()}
+        })
         .collect();
     obj! {"entries" => entries, "kinds" => kinds, "totals_at" => at}
 }
@@ -334,6 +351,7 @@ mod tests {
                 bytes: i,
                 free: i % 3 == 0,
                 reason: String::new(),
+                project: None,
             })
             .collect();
         let j = last_scan(list, 7);
