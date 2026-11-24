@@ -132,6 +132,22 @@ pub fn tick(ctx: &Ctx, budget: u64, emit: &mut dyn FnMut(Json)) -> bool {
     true
 }
 
+/// The `rescan` op: the scan and listing a tick saves, made now; nothing is reclaimed.
+/// Returns the new last-scan.json.
+pub fn rescan(ctx: &Ctx) -> Result<Json, String> {
+    let s = scan_home(ctx)?;
+    Ok(save_measured(ctx, &s, &[]))
+}
+
+/// Saves the totals and last-scan.json of a scan made outside a tick (the rest of the
+/// autopilot memory stays as it is) and returns last-scan.json.
+fn save_measured(ctx: &Ctx, s: &scan::Scan, gone: &[PathBuf]) -> Json {
+    let mut st = state::load_state(ctx);
+    let last = measure(&mut st, s, gone, ctx.now);
+    save(ctx, st, Some(last.clone()));
+    last
+}
+
 /// A scan of home with the folders it keeps sized too, as the totals need.
 fn scan_home(ctx: &Ctx) -> Result<scan::Scan, String> {
     let mut s = scan::scan(ctx, &ctx.home)?;

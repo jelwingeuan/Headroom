@@ -24,8 +24,14 @@ pub fn call(request: &str) -> Json {
         "digest" => digest(&ctx),
         "samples" => samples(&ctx),
         "breakdown" => breakdown(&ctx),
+        "rescan" => rescan(&ctx),
         op => error(format!("unknown op {op:?}")),
     }
+}
+
+/// Scans now and saves the totals and breakdown a tick would; replies with that breakdown.
+fn rescan(ctx: &Ctx) -> Json {
+    autopilot::rescan(ctx).unwrap_or_else(error)
 }
 
 fn samples(ctx: &Ctx) -> Json {
@@ -409,5 +415,58 @@ mod tests {
         assert!(undo(&ctx, &obj! {"id" => "nope"}).get("error").is_some());
         let d = digest(&ctx);
         assert!(!d.s("body").is_empty());
+    }
+
+    /// A committed Node project whose 1 MB node_modules was last touched at `when`.
+    fn project(ctx: &Ctx, name: &str, when: u64) -> std::path::PathBuf {
+        use crate::testutil::{git, touch, write};
+        let p = ctx.home.join("code").join(name);
+        write(&p.join("package.json"), "{}");
+        write(&p.join("package-lock.json"), "{}");
+        write(&p.join(".gitignore"), "node_modules/\n");
+        git(&p, &["init", "-q"], Some(when));
+        git(&p, &["add", "-A"], Some(when));
+        git(&p, &["commit", "-qm", "c"], Some(when));
+        std::fs::create_dir_all(p.join("node_modules/x")).unwrap();
+        std::fs::write(p.join("node_modules/x/blob.js"), vec![1u8; 1 << 20]).unwrap();
+        write(&p.join("node_modules/.package-lock.json"), "{}");
+        touch(&p.join("node_modules/x/blob.js"), when);
+        p
+    }
+
+    fn listed(b: &Json) -> Vec<String> {
+        b.get("entries").unwrap().arr().iter().map(|e| e.s("path").to_string()).collect()
+    }
+
+    #[test]
+    fn rescan_saves_a_fresh_breakdown_and_totals_now() {
+        let mut ctx = crate::testutil::ctx("api-rescan");
+        let a = project(&ctx, "a", 1_600_000_000).join("node_modules");
+        let a_str = a.to_string_lossy().into_owned();
+        let scans = || crate::scan::SCANS.with(|n| n.get());
+        let before = scans();
+        let b = rescan(&ctx);
+        assert_eq!(scans(), before + 1, "one scan");
+        assert_eq!(breakdown(&ctx), b, "saved as returned");
+        assert!(listed(&b).contains(&a_str), "{b}");
+        let s = status(&ctx);
+        assert_eq!(s.get("totals_at").and_then(Json::u64), Some(ctx.now));
+        assert!(s.get("reclaimable_bytes").and_then(Json::u64).unwrap() >= 1 << 20, "{s}");
+        assert_eq!(s.get("last_tick"), Some(&Json::Null), "a rescan is not a tick");
+        assert!(a.join("x/blob.js").exists(), "nothing deleted");
+
+        // The disk changed since: the next rescan shows it without waiting a day.
+        let new = project(&ctx, "b", 1_600_000_000).join("node_modules");
+        std::fs::remove_dir_all(&a).unwrap();
+        ctx.now += 60;
+        let b = rescan(&ctx);
+        assert_eq!(breakdown(&ctx), b);
+        assert_eq!(b.get("totals_at").and_then(Json::u64), Some(ctx.now));
+        assert!(!listed(&b).contains(&a_str), "{b}");
+        assert!(listed(&b).contains(&new.to_string_lossy().into_owned()), "{b}");
+
+        let mut gone = ctx.clone();
+        gone.home = ctx.home.join("missing");
+        assert!(rescan(&gone).get("error").is_some());
     }
 }
