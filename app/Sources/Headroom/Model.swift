@@ -48,7 +48,7 @@ final class AppModel: ObservableObject {
         settings = Settings(Core.call(["op": "settings_get"]))
         samples = Core.call(["op": "samples"])
         breakdown = Core.call(["op": "breakdown"])
-        if let tick = fixture["tick"] as? JSON { lastCheck = LastCheck(tick) } else { ticking = 1 } // no reply yet: in flight
+        if let tick = fixture["tick"] as? JSON { lastCheck = LastCheck(tick, at: Date(timeIntervalSince1970: TimeInterval(Screens.now))) } else { ticking = 1 } // no reply yet: in flight
         self.pane = pane
     }
 
@@ -251,7 +251,7 @@ struct LastCheck {
         } else if events.contains(where: { $0.string("event") == "shortfall" }) {
             text = "Below budget, and nothing left is safe to free"
         } else {
-            text = "Free space checked, nothing needed"
+            text = "Checked"
         }
     }
 }

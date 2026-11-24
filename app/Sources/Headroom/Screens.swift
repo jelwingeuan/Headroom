@@ -243,7 +243,7 @@ enum Screens {
             let i = Insights(status: s, actions: rows.map(Candidate.init), samples: f.object("samples")!, breakdown: f.object("breakdown")!)
             let free = i.kinds.reduce(0) { $0 + $1.free }, kept = i.kinds.reduce(0) { $0 + $1.kept }
             let byReason = i.reasons.reduce(0) { $0 + $1.kept }
-            expect(free == s.canComeBack ?? 0, "\(world): kinds' can-be-freed \(free) ≠ status reclaimable_bytes \(s.canComeBack ?? 0)")
+            expect(free + i.freeingNow == s.canComeBack ?? 0, "\(world): kinds' can-be-freed \(free) ≠ status reclaimable_bytes \(s.canComeBack ?? 0)")
             expect(kept == s.protectedBytes ?? 0, "\(world): kinds' protected \(kept) ≠ status protected_bytes \(s.protectedBytes ?? 0)")
             expect(byReason == s.protectedBytes ?? 0, "\(world): reasons \(byReason) ≠ status protected_bytes \(s.protectedBytes ?? 0)")
             print("SELF-CHECK \(world): can be freed \(free) = \(s.canComeBack ?? 0), protected \(kept) = by reason \(byReason) = \(s.protectedBytes ?? 0)")
@@ -285,7 +285,7 @@ enum Screens {
         let busy: JSON = ["event": "skip", "path": "/Users/me/code/shop/node_modules", "kind": "node_modules",
                           "reason": "in use: node is working in /Users/me/code/shop"]
         expect(line([busy]) == "Waiting: shop is in use", "live line: \(line([busy]))")
-        expect(line([["event": "tick"]]) == "Free space checked, nothing needed", "live line: \(line([["event": "tick"]]))")
+        expect(line([["event": "tick"]]) == "Checked", "live line: \(line([["event": "tick"]]))")
         return failures
     }
 

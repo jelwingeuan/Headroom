@@ -16,9 +16,11 @@ struct Insights {
     struct Bar: Identifiable {
         let name: String
         var free: Int64 = 0, kept: Int64 = 0
+        /// Being deleted right now: shown in teal, never as "can be freed".
+        var freeing: Int64 = 0
         var color = Color.gray
         var id: String { name }
-        var total: Int64 { free + kept }
+        var total: Int64 { free + kept + freeing }
     }
 
     /// Question 4 over one period.
@@ -42,6 +44,7 @@ struct Insights {
     var totalsAt: Date?
     var week = Tally(), total = Tally()
     var wouldFree: Int64 = 0
+    var freeingNow: Int64 = 0
     /// history returns the newest 500 rows, so "in total" can only mean those.
     var capped = false
 
@@ -62,6 +65,11 @@ struct Insights {
             let v = v as? JSON ?? [:], k = Kind(kind), name = k.group
             groups[name, default: Bar(name: name, color: k.color)].free += v.int("free_bytes") ?? 0
             groups[name, default: Bar(name: name)].kept += v.int("protected_bytes") ?? 0
+        }
+        if let next = status.next, !status.dryRun, (status.freeBytes ?? 0) < (status.budgetBytes ?? 0), groups[Kind(next.kind).group] != nil {
+            groups[Kind(next.kind).group]!.free -= next.bytes
+            groups[Kind(next.kind).group]!.freeing += next.bytes
+            freeingNow = next.bytes
         }
         let kept = Dictionary(uniqueKeysWithValues: Self.reasonNames.map {
             ($0.key, Bar(name: $0.name, kept: status.protectedByReason[$0.key] ?? 0))
@@ -232,7 +240,7 @@ struct InsightsContent: View {
 
     private func spaceAnswer(_ i: Insights) -> String {
         let free = i.kinds.reduce(0) { $0 + $1.free }, kept = i.kinds.reduce(0) { $0 + $1.kept }
-        return "\(bytes(free)) can be freed and \(bytes(kept)) is protected. The largest group is \(i.kinds[0].name), at \(bytes(i.kinds[0].total))."
+        return "\(bytes(free)) can be freed\(i.freeingNow > 0 ? ", \(bytes(i.freeingNow)) is being freed now," : "") and \(bytes(kept)) is protected. The largest group is \(i.kinds[0].name), at \(bytes(i.kinds[0].total))."
     }
 
     private func keptAnswer(_ i: Insights, _ s: Status) -> String {
@@ -386,18 +394,18 @@ struct FreeSpaceChart: View, AXChartDescriptorRepresentable {
                 ForEach(gaps, id: \.self) { t in
                     RuleMark(x: .value("Time", t)).foregroundStyle(Color.secondary.opacity(0.4))
                         .lineStyle(StrokeStyle(lineWidth: 1, dash: [2, 3]))
-                        .annotation(position: .top) { Text("Mac asleep").font(.caption).foregroundStyle(.secondary) }
+                        .annotation(position: .bottom) { Text("Mac asleep").font(.caption).foregroundStyle(.secondary) }
+                }
+                ForEach(insights.acted) { a in
+                    PointMark(x: .value("Time", a.when), y: .value("Free", grow ? gb(insights.free(at: a.when) ?? 0) : 0))
+                        .foregroundStyle(Color.headroom)
+                        .symbolSize(44)
                 }
                 if let end {
                     let jump = jumps.first { near($0.at, end.at) }.map { "\(bytes($0.bytes)) freed outside Headroom · " } ?? ""
                     PointMark(x: .value("Time", end.at), y: .value("Free", grow ? gb(end.free) : 0))
                         .symbolSize(30).foregroundStyle(Color.primary)
                         .annotation(position: .top, alignment: .trailing) { Text("\(jump)Now \(bytes(end.free))").font(.caption).monospacedDigit() }
-                }
-                ForEach(insights.acted) { a in
-                    PointMark(x: .value("Time", a.when), y: .value("Free", grow ? gb(insights.free(at: a.when) ?? 0) : 0))
-                        .foregroundStyle(Color.headroom)
-                        .symbolSize(44)
                 }
             }
             .chartXScale(domain: span)
@@ -475,10 +483,13 @@ struct BarsChart: View, AXChartDescriptorRepresentable {
                 ForEach(bars) { b in
                     BarMark(x: .value("Size", grow ? gb(b.free) : 0), y: .value("Group", b.name), height: .ratio(0.6))
                         .foregroundStyle(b.color)
+                    BarMark(x: .value("Size", grow ? gb(b.freeing) : 0), y: .value("Group", b.name), height: .ratio(0.6))
+                        .foregroundStyle(Color.headroom)
                     BarMark(x: .value("Size", grow ? gb(b.kept) : 0), y: .value("Group", b.name), height: .ratio(0.6))
                         .foregroundStyle(keptStyle)
                         .annotation(position: .trailing) { // the split in words, so it never rests on color
-                            Text(keptStyle == .secondary ? bytes(b.total) : "\(bytes(b.free)) of \(bytes(b.total)) can be freed")
+                            Text(keptStyle == .secondary ? bytes(b.total) : b.free == 0 && b.freeing == 0 ? "None of \(bytes(b.total)) can be freed"
+                                 : "\(bytes(b.free)) of \(bytes(b.total)) can be freed" + (b.freeing > 0 ? ", \(bytes(b.freeing)) freeing now" : ""))
                                 .font(.caption).monospacedDigit()
                         }
                 }
@@ -570,7 +581,7 @@ struct About: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Headroom keeps the free space you chose on this Mac. When free space drops below your budget, it deletes folders your tools can rebuild, such as dependencies, build output and downloaded AI models, starting with the ones unused the longest. Every delete is listed in History, where Rebuild brings it back.")
+            Text("Headroom keeps the free space you chose on this Mac. When free space drops below your budget, it deletes folders your tools can rebuild, such as dependencies, build output and downloaded AI models, starting with the ones unused the longest. Every delete is listed in History, with how to get it back.")
                 .fixedSize(horizontal: false, vertical: true)
             VStack(alignment: .leading, spacing: 8) {
                 rule("checkmark.seal", "Proof first: a folder counts only when its project file sits beside it, like node_modules beside package.json.")

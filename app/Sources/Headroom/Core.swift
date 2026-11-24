@@ -203,6 +203,8 @@ struct Kind {
     var label: String, group: String, section = Section.projects, color = Color.gray
     /// Set: the Overview shows it unticked, and says this in one sentence.
     var unticked: String?
+    /// How it comes back when that isn't Rebuild, said in History.
+    var comesBack: String?
 
     init(_ kind: String) {
         switch kind {
@@ -212,14 +214,18 @@ struct Kind {
         case ".venv", "venv": (label, group) = ("Python environment", "Other")
         case "worktree": (label, group, color) = ("Agent worktree", "Worktrees", .indigo)
         case "DerivedData", "derived_data": (label, group, section, color) = ("Xcode build files", "Xcode, all of it", .xcode, .blue)
-        case "device_support": (label, group, section, color) = ("Device symbols", "Xcode, all of it", .xcode, .blue)
+        case "device_support":
+            (label, group, section, color) = ("Device symbols", "Xcode, all of it", .xcode, .blue)
+            comesBack = "Xcode copies them again the next time that device connects."
         case "xcode_archive": (label, group, section, color) = ("Xcode archive", "Xcode, all of it", .xcode, .blue)
         case "simulator":
             (label, group, section, color) = ("iOS simulator", "Xcode, all of it", .xcode, .blue)
             unticked = "Left unticked: its apps and test data can't come back; Recreate gives a blank device."
         case "model", "ollama", "hf", "ollama_model", "hf_model", "lmstudio_model":
             (label, group, section, color) = ("AI model", "AI models", .models, .purple)
-        case "claude_code_old": (label, group, section, color) = ("Old Claude Code version", "AI-tool leftovers", .aiTools, .brown)
+        case "claude_code_old":
+            (label, group, section, color) = ("Old Claude Code version", "AI-tool leftovers", .aiTools, .brown)
+            comesBack = "Claude Code's installer brings any version back if you need it."
         case "codex_temp": (label, group, section, color) = ("Codex temporary files", "AI-tool leftovers", .aiTools, .brown)
         case "app_cache", "electron_cache": (label, group, section, color) = ("App cache", "AI-tool leftovers", .aiTools, .brown)
         case "ai_history": (label, group, section, color) = ("AI conversation history", "AI-tool leftovers", .aiTools, .brown)

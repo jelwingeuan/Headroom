@@ -16,7 +16,8 @@ struct Overview {
     struct Group: Identifiable {
         let id: String, title: String
         var nodes: [Node]
-        var bytes: Int64 { nodes.reduce(0) { $0 + $1.bytes } }
+        var freeing: String?
+        var bytes: Int64 { nodes.flatMap { $0.item.map { [$0] } ?? $0.rows }.filter { $0.path != freeing }.reduce(0) { $0 + $1.bytes } }
     }
 
     var groups: [Group] = []
@@ -46,7 +47,7 @@ struct Overview {
             } else {
                 nodes = rows.map { Node(id: $0.path, item: $0) }
             }
-            groups.append(Group(id: section.title, title: section.title, nodes: nodes.sorted { ($0.bytes, $0.id) > ($1.bytes, $1.id) }))
+            groups.append(Group(id: section.title, title: section.title, nodes: nodes.sorted { ($0.bytes, $0.id) > ($1.bytes, $1.id) }, freeing: freeing))
         }
     }
 }
@@ -98,7 +99,7 @@ struct OverviewView: View {
         .listStyle(.inset(alternatesRowBackgrounds: false))
         .animation(.headroom, value: list.freeable.map(\.path)) // deleted rows collapse, nothing overshoots
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            if !list.freeable.isEmpty { BottomBar(count: chosen.count, total: total, dryRun: s.dryRun, working: model.working) { confirming = true } }
+            if !list.freeable.isEmpty { BottomBar(count: chosen.count, total: total, all: list.freeable.filter { $0.freesHost && $0.path != list.freeing }.reduce(0) { $0 + $1.bytes }, dryRun: s.dryRun, working: model.working) { confirming = true } }
         }
         .background { // Space ticks the selected rows; ⌘A ticks everything; ⌘⌫ asks to delete.
             Button("") { toggle(selection, list) }.keyboardShortcut(.space, modifiers: []).hidden()
@@ -166,6 +167,8 @@ private struct Header: View {
                     Label("\(bytes(b - f)) below your budget. Dry run: nothing is deleted" + (days > 0 ? " for \(days) more \(days == 1 ? "day" : "days")." : "."),
                           systemImage: "gauge.with.dots.needle.33percent")
                 }
+            } else if let f = status.freeBytes, let b = status.budgetBytes, b > 0 {
+                Label("\(bytes(f - b)) above your \(bytes(b)) budget, so Headroom has nothing to do.", systemImage: "gauge.with.dots.needle.67percent")
             }
             if status.budgetBytes == 0 {
                 Text("Headroom deletes nothing until you set a budget.")
@@ -191,8 +194,7 @@ private struct Header: View {
         if status.totalsAt == nil {
             return "Headroom's first check lists every folder it could free, and every one it keeps. It takes a minute or two."
         }
-        let b = status.budgetBytes ?? 0
-        var parts = [status.freeBytes.map { f in "\(bytes(f)) free" + (b == 0 ? "." : f >= b ? ", \(bytes(f - b)) above your \(bytes(b)) budget." : ".") },
+        var parts = [status.freeBytes.map { f in "\(bytes(f)) free." },
                      count > 0 ? "\(count) \(count == 1 ? "folder" : "folders")\(unticked > 0 ? ", \(bytes(unticked)) of it left unticked" : "")"
                         + "\(docker > 0 ? ", plus \(bytes(docker)) inside Docker" : "")." : nil,
                      kept > 0 ? "\(bytes(kept)) is protected." : nil]
@@ -226,7 +228,7 @@ private struct ProjectCard: View {
                     Toggle(sources: ticks.compactMap { $0 }, isOn: \.self) { EmptyView() }.toggleStyle(.checkbox).labelsHidden()
                         .accessibilityLabel("All of \(node.title)")
                 } else { // its only folder is being freed right now
-                    ProgressView().controlSize(.small).frame(width: 16).accessibilityLabel("Freeing")
+                    Color.clear.frame(width: 16) // the folder row below carries the spinner
                 }
                 Text(node.title).font(.headline)
                 Text(node.place).foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
@@ -280,7 +282,8 @@ struct ItemRow: View {
                 .font(.subheadline)
                 if let note {
                     if item.canFree && tick != nil { // unticked by default: a caution, said once
-                        Label { Text(note) } icon: { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
+                        Label { Text(note) } icon: { item.dataLoss != nil || item.kind == "simulator" // a warning only where data can't come back
+                            ? Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange) : Image(systemName: "info.circle").foregroundStyle(.secondary) }
                             .font(.subheadline).fixedSize(horizontal: false, vertical: true)
                     } else {
                         Text(note).font(.subheadline).fixedSize(horizontal: false, vertical: true)
@@ -333,12 +336,12 @@ private struct Tag: View {
 
 /// "10 selected · 6.7 GB" and the one button. The total counts as rows are ticked.
 private struct BottomBar: View {
-    let count: Int, total: Int64, dryRun: Bool, working: Bool
+    let count: Int, total: Int64, all: Int64, dryRun: Bool, working: Bool
     let go: () -> Void
 
     var body: some View {
         HStack {
-            Text("\(count) selected · \(bytes(total))").monospacedDigit()
+            Text("\(count) selected · \(bytes(total))\(total < all ? " of \(bytes(all))" : "")").monospacedDigit()
                 .contentTransition(.numericText()).animation(.headroom, value: total)
             if working { ProgressView().controlSize(.small).padding(.leading, 4) }
             Spacer()
@@ -394,7 +397,7 @@ struct ConfirmSheet: View {
             HStack {
                 Spacer()
                 Button("Cancel", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
-                Button(dryRun ? "Record in History" : "Delete \(bytes(total))", role: .destructive) { go(); dismiss() }
+                Button(dryRun ? "Record \(bytes(total))" : "Delete \(bytes(total))", role: .destructive) { go(); dismiss() }
                     .keyboardShortcut(.defaultAction)
             }
         }

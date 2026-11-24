@@ -36,7 +36,7 @@ struct MainView: View {
                 VStack(alignment: .leading, spacing: 16) {
                     Text("How Headroom decides").font(.title.weight(.bold))
                     About(recentDays: model.settings?.recentDays ?? 14)
-                    Text("\(version) · MIT License").font(.caption).foregroundStyle(.secondary)
+                    Text("MIT License").font(.caption).foregroundStyle(.secondary)
                 }
                 .padding(24).frame(maxWidth: 640, alignment: .leading)
             }
@@ -103,6 +103,7 @@ struct HistoryView: View {
         let when = a.date.map(ago) ?? "at an unknown time"
         if busy { return "Rebuilding…" }
         if !a.freesHost && !a.dryRun { return "Deleted \(when). Docker rebuilds this cache on its next build." }
+        if let back = a.info.comesBack, !a.dryRun { return "Deleted \(when). \(back)" }
         if a.dryRun { return "Dry run: would have been deleted \(when). Nothing was deleted." }
         return a.undone ? "Deleted \(when), and rebuilt since." : "Deleted \(when)."
     }
@@ -127,7 +128,7 @@ private struct HistoryHeader: View {
         let freed = sum(done.filter { !$0.undone && $0.freesHost }), rebuilt = sum(done.filter(\.undone))
         let docker = sum(done.filter { !$0.undone && !$0.freesHost })
         VStack(alignment: .leading, spacing: 8) {
-            Text(done.isEmpty ? "Nothing deleted yet" : "\(bytes(freed)) freed").font(.largeTitle.weight(.bold)).monospacedDigit()
+            Text(done.isEmpty ? "Dry run: nothing deleted yet" : "\(bytes(freed)) freed since \(done.map(\.when).min()!.formatted(.dateTime.month(.abbreviated).day().locale(Locale(identifier: "en"))))").font(.largeTitle.weight(.bold)).monospacedDigit()
             Text(done.isEmpty ? "\(bytes(sum(actions.filter(\.dryRun)))) would have gone in the dry run."
                  : ["Still free on this Mac.", rebuilt > 0 ? "\(bytes(rebuilt)) was rebuilt since." : nil,
                     docker > 0 ? "\(bytes(docker)) was inside Docker's disk." : nil].compactMap { $0 }.joined(separator: " "))
@@ -198,8 +199,8 @@ struct SettingsView: View {
                     Text("Dry run")
                 } footer: {
                     Footnote(binding.wrappedValue.dryRun
-                        ? "Nothing is deleted while this is on. It's on for your first 7 days, and what it would delete is listed in History."
-                        : "Every deletion is listed in History, where Rebuild brings it back.")
+                        ? "Nothing is deleted while this is on. It's on for your first 7 days\(model.status.dryRunDaysLeft.map { ", \($0) left" } ?? ""), and what it would delete is listed in History."
+                        : "Every deletion is listed in History, with how to get it back.")
                 }
             } else {
                 ProgressView("Loading settings…")
