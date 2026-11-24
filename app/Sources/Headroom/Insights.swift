@@ -378,7 +378,7 @@ struct FreeSpaceChart: View, AXChartDescriptorRepresentable {
                 // M8: nothing on the chart goes unexplained. Jumps Headroom didn't make, the breaks
                 // where the Mac slept, and where the line ends today all carry a label.
                 let jumps = insights.jumps, end = insights.samples.last
-                ForEach(jumps.filter { $0.at != end?.at }, id: \.at) { j in
+                ForEach(jumps.filter { !near($0.at, end?.at) }, id: \.at) { j in
                     PointMark(x: .value("Time", j.at), y: .value("Free", grow ? gb(insights.free(at: j.at) ?? 0) : 0))
                         .symbol(.circle).symbolSize(30).foregroundStyle(Color.primary)
                         .annotation(position: .top, alignment: .trailing) { Text("You freed \(bytes(j.bytes))").font(.caption) }
@@ -389,7 +389,7 @@ struct FreeSpaceChart: View, AXChartDescriptorRepresentable {
                         .annotation(position: .top) { Text("Mac asleep").font(.caption).foregroundStyle(.secondary) }
                 }
                 if let end {
-                    let jump = jumps.first { $0.at == end.at }.map { "You freed \(bytes($0.bytes)) · " } ?? ""
+                    let jump = jumps.first { near($0.at, end.at) }.map { "You freed \(bytes($0.bytes)) · " } ?? ""
                     PointMark(x: .value("Time", end.at), y: .value("Free", grow ? gb(end.free) : 0))
                         .symbolSize(30).foregroundStyle(Color.primary)
                         .annotation(position: .top, alignment: .trailing) { Text("\(jump)Now \(bytes(end.free))").font(.caption).monospacedDigit() }
@@ -402,9 +402,9 @@ struct FreeSpaceChart: View, AXChartDescriptorRepresentable {
             }
             .chartXScale(domain: span)
             .chartXAxis {
-                AxisMarks(values: days) { _ in
+                AxisMarks(values: days) { v in
                     AxisGridLine()
-                    AxisValueLabel(format: .dateTime.month(.abbreviated).day())
+                    AxisValueLabel { if let d = v.as(Date.self) { Text(d.formatted(.dateTime.month(.abbreviated).day().locale(Locale(identifier: "en")))) } }
                 }
             }
             .chartYScale(domain: 0...max(top, 1))
@@ -426,6 +426,9 @@ struct FreeSpaceChart: View, AXChartDescriptorRepresentable {
         .accessibilityValue(summary)
         .accessibilityChartDescriptor(self)
     }
+
+    /// Close enough to the end that two labels would collide: they become one.
+    private func near(_ a: Date, _ b: Date?) -> Bool { b.map { abs(a.timeIntervalSince($0)) < 12 * 3600 } ?? false }
 
     /// The middle of each break in the line.
     private var gaps: [Date] {
@@ -475,7 +478,7 @@ struct BarsChart: View, AXChartDescriptorRepresentable {
                     BarMark(x: .value("Size", grow ? gb(b.kept) : 0), y: .value("Group", b.name), height: .ratio(0.6))
                         .foregroundStyle(keptStyle)
                         .annotation(position: .trailing) { // the split in words, so it never rests on color
-                            Text(b.free > 0 && b.kept > 0 ? "\(bytes(b.free)) of \(bytes(b.total)) can be freed" : bytes(b.total))
+                            Text(keptStyle == .secondary ? bytes(b.total) : "\(bytes(b.free)) of \(bytes(b.total)) can be freed")
                                 .font(.caption).monospacedDigit()
                         }
                 }

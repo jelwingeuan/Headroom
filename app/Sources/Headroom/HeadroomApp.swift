@@ -132,11 +132,13 @@ struct SpaceBar: View {
                 ZStack(alignment: .topLeading) {
                     Text("\(bytes(capacity)) disk").foregroundStyle(.secondary).monospacedDigit()
                         .frame(maxWidth: .infinity, alignment: .trailing)
-                        .opacity(budget > 0 && at > geo.size.width - 150 ? 0 : 1)
-                    if budget > 0 {
-                        Label("\(bytes(budget)) budget", systemImage: "line.diagonal").labelStyle(BudgetLabelStyle())
+                        .opacity(budget > 0 && at > geo.size.width - 210 ? 0 : 1)
+                    if budget > 0 { // the label's tick sits exactly under the marker, flipped near the right end
+                        let flip = at > geo.size.width - 130
+                        Label("\(bytes(budget)) budget", systemImage: "line.diagonal").labelStyle(BudgetLabelStyle(tickTrailing: flip))
                             .fixedSize()
-                            .position(x: min(max(at, 50), geo.size.width - 50), y: 8)
+                            .frame(maxWidth: .infinity, alignment: flip ? .trailing : .leading)
+                            .offset(x: flip ? at - geo.size.width + 1 : at - 1)
                     }
                 }
             }
@@ -164,7 +166,7 @@ struct HatchedBar: View {
                 var p = Path()
                 p.move(to: CGPoint(x: x, y: size.height))
                 p.addLine(to: CGPoint(x: x + size.height, y: 0))
-                ctx.stroke(p, with: .color(Color.primary.opacity(0.55)), lineWidth: 1.5)
+                ctx.stroke(p, with: .color(Color.primary.opacity(0.8)), lineWidth: 1.5)
                 x += 4
             }
         }
@@ -194,10 +196,12 @@ struct Swatch: View {
 
 /// "| 60 GB budget": a short vertical tick like the one on the chart, then the label.
 struct BudgetLabelStyle: LabelStyle {
+    var tickTrailing = false
     func makeBody(configuration: Configuration) -> some View {
         HStack(spacing: 4) {
-            Rectangle().fill(.primary).frame(width: 2, height: 10)
+            if !tickTrailing { Rectangle().fill(.primary).frame(width: 2, height: 10) }
             configuration.title.foregroundStyle(.secondary).monospacedDigit()
+            if tickTrailing { Rectangle().fill(.primary).frame(width: 2, height: 10) }
         }
     }
 }
@@ -397,7 +401,7 @@ struct LiveLine: View {
                     .frame(width: 20)
                 // M10: "2 minutes ago", never a bare "00:30" that reads like a duration.
                 let when = ago(last.at)
-                Text("\(last.text), \(when)").lineLimit(2)
+                Text("\(last.text) · \(when)").lineLimit(2)
             }
         }
         .font(.callout)

@@ -13,7 +13,7 @@ enum Screens {
                     dryRun: Bool = false, undone: Bool = false, rebuild: String? = nil) -> JSON {
         var r: JSON = ["id": id, "path": path, "kind": kind, "bytes": Int64(gb * 1e9),
                        "at": now - Int64(daysAgo * 86_400), "dry_run": dryRun, "undone": undone,
-                       "reason": "not opened for 94 days"]
+                       "reason": "git ignores it; last used \(30 + Int(daysAgo)) days ago"]
         if let rebuild { r["rebuild"] = rebuild }
         return r
     }
@@ -49,19 +49,19 @@ enum Screens {
               "the newest iPhone 16 Pro simulator of its type is always kept"),
         entry("/Users/me/code/app/.claude/worktrees/fix-login", "worktree", 2.4,
               "in use: node is working in /Users/me/code/app/.claude/worktrees/fix-login"),
-        entry("/Users/me/code/shop/node_modules", "node_modules", 1.1, "used 2 days ago (recent: the last 14 days)"),
+        entry("/Users/me/code/store/node_modules", "node_modules", 1.1, "used 2 days ago (recent: the last 14 days)"),
         entry("/Users/me/Library/Application Support/Claude/Cache", "electron_cache", 0.5, "Claude is running"),
         entry("/Users/me/code/notes/build", "build", 0.4, "git tracks files inside it"),
     ]
     /// status's split of the same 21 GB, typed in separately so the self-check compares two sources.
-    static let keptByReason: JSON = ["recent": gigs(11.9), "in_use": gigs(2.9), "history": gigs(3.2), "other": gigs(3.0)]
+    static let keptByReason: JSON = ["recent": gigs(10.9), "in_use": gigs(2.9), "history": gigs(3.2), "other": gigs(3.0)]
 
     /// What the dry-run world's scan could free: 36.5 GB listed (plus 1.5 GB unlisted).
     static let canFree = [
         entry("/Users/me/.cache/huggingface/hub/models--mistralai--Mistral-7B-v0.1", "hf_model", 14.5,
               "Hugging Face model mistralai/Mistral-7B-v0.1, downloaded from the Hub; last used 71 days ago", free: true),
         entry("/Users/me/Library/Developer/Xcode/DerivedData/Atlas-bxjqk", "DerivedData", 7.4,
-              "Xcode build data for /Users/me/code/atlas/Atlas.xcodeproj; last used 38 days ago", free: true),
+              "Xcode build data for /Users/me/code/atlas/Atlas.xcodeproj; last used 38 days ago", free: true, project: "/Users/me/code/atlas"),
         entry("/Users/me/code/game/target", "target", 6.3,
               "Rust project (Cargo.toml); git ignores it; last used 41 days ago; rebuild: cargo build", free: true, project: "/Users/me/code/game"),
         entry("/Users/me/code/game/web/node_modules", "node_modules", 0.8,
@@ -81,12 +81,12 @@ enum Screens {
     ]
 
     /// Docker: listed for the Overview, outside every total (its space is inside Docker's disk).
-    static let dockerEntry = entry("docker://build-cache", "docker_build_cache", 3.4, "Docker build cache; unused for 30 days", free: true)
+    static let dockerEntry = entry("docker://build-cache", "docker_build_cache", 3.4, "Docker build cache; last used 30 days ago", free: true)
 
     /// A `breakdown` reply: these entries plus `kept`, and per-kind totals that also count the
     /// node_modules too small to be listed.
     static func scan(_ free: [JSON], unlisted: Double) -> JSON {
-        var kinds: JSON = ["node_modules": ["free_bytes": gigs(unlisted), "protected_bytes": gigs(1.0)] as JSON]
+        var kinds: JSON = ["node_modules": ["free_bytes": gigs(unlisted), "protected_bytes": Int64(0)] as JSON]
         for e in free + kept where e.bool("frees_host") == true {
             let key = e.bool("free")! ? "free_bytes" : "protected_bytes"
             var k = kinds.object(e.string("kind")!) ?? ["free_bytes": Int64(0), "protected_bytes": Int64(0)]
@@ -123,17 +123,17 @@ enum Screens {
     /// The Insights ops per world. first-run has no tick reply: its first check is still running.
     static let insights: [String: JSON] = [
         "first-run": ["samples": ["samples": [JSON]()], "breakdown": ["entries": NSNull(), "kinds": NSNull(), "totals_at": NSNull()]],
-        "dry-run": ["samples": samples(3, free: 52 * GB, budget: 60 * GB, drift: 3), "breakdown": scan(canFree, unlisted: 1.5),
+        "dry-run": ["samples": samples(3, free: 52 * GB, budget: 60 * GB, drift: 3), "breakdown": scan(canFree, unlisted: 0),
                     "tick": ["events": [reclaimed(wouldHave[1], event: "would_reclaim")]]],
         "plenty": ["samples": samples(30, free: 112 * GB, budget: 60 * GB, drift: 1.6, rows: done, jump: (0.1, 55)),
-                   "breakdown": scan(Array(canFree.dropFirst()), unlisted: 2.0), "tick": ["events": [JSON]()]],
+                   "breakdown": scan(Array(canFree.dropFirst()), unlisted: 0), "tick": ["events": [JSON]()]],
         "acting": ["samples": samples(30, free: 57 * GB, budget: 60 * GB, drift: 0.7, rows: done),
                    "breakdown": scan([
                        entry("/Users/me/code/engine/target", "target", 4.8,
                              "Rust project (Cargo.toml); git ignores it; last used 33 days ago; rebuild: cargo build", free: true, project: "/Users/me/code/engine"),
                        entry("/Users/me/Library/Developer/Xcode/iOS DeviceSupport/iPhone15,2 17.5 (21F79)", "device_support", 2.1,
                              "symbols copied from an older device OS", free: true),
-                   ] + canFree.suffix(3), unlisted: 0.9),
+                   ] + canFree.suffix(3), unlisted: 0),
                    "tick": ["events": [reclaimed(done[0])]]],
         "error": ["samples": failed, "breakdown": failed, "tick": failed],
     ]
@@ -147,15 +147,15 @@ enum Screens {
         ("first-run", ["capacity_bytes": 245 * GB, "free_bytes": 18 * GB, "budget_bytes": 0, "dry_run": true, "dry_run_days_left": 7,
                        "permission_errors": 3], [], settings(0, dryRun: true)),
         ("dry-run", ["capacity_bytes": 245 * GB, "free_bytes": 52 * GB, "budget_bytes": 60 * GB, "dry_run": true, "dry_run_days_left": 4,
-                     "next": wouldHave[1], "reclaimable_bytes": gigs(40.7), "protected_bytes": 21 * GB,
+                     "next": wouldHave[1], "reclaimable_bytes": gigs(39.2), "protected_bytes": 20 * GB,
                      "protected_by_reason": keptByReason, "totals_at": now - 7200],
          wouldHave, settings(60, dryRun: true)),
         ("plenty", ["capacity_bytes": 245 * GB, "free_bytes": 112 * GB, "budget_bytes": 60 * GB, "dry_run": false,
-                    "reclaimable_bytes": gigs(26.7), "protected_bytes": 21 * GB,
+                    "reclaimable_bytes": gigs(24.7), "protected_bytes": 20 * GB,
                     "protected_by_reason": keptByReason, "totals_at": now - 7200],
          done + [docker] + wouldHave, settings(60, dryRun: false)),
         ("acting", ["capacity_bytes": 245 * GB, "free_bytes": 57 * GB, "budget_bytes": 60 * GB, "dry_run": false, "next": done[1],
-                    "snapshot_holding": true, "reclaimable_bytes": gigs(10.3), "protected_bytes": 21 * GB,
+                    "snapshot_holding": true, "reclaimable_bytes": gigs(9.4), "protected_bytes": 20 * GB,
                     "protected_by_reason": keptByReason, "totals_at": now - 7200], done, settings(60, dryRun: false)),
         ("error", ["error": "Headroom's core gave no reply. Quit and reopen Headroom."], [], settings(60, dryRun: false)),
     ]
@@ -208,11 +208,13 @@ enum Screens {
                 shoot(OverviewView().environmentObject(overview), size: CGSize(width: 760, height: 1900), appearance,
                       dir.appendingPathComponent("overview-full-\(world)-\(look).png"))
                 let picks = Overview(overview.breakdown).freeable.filter { $0.info.unticked == nil }
-                shoot(ConfirmSheet(rows: picks, dryRun: overview.status.dryRun, history: overview.actions) {}, size: nil, appearance,
-                      dir.appendingPathComponent("sheet-\(world)-\(look).png"))
+                if !picks.isEmpty {
+                    shoot(ConfirmSheet(rows: picks, dryRun: overview.status.dryRun, history: overview.actions) {}
+                        .background(Color(nsColor: .windowBackgroundColor)), size: nil, appearance, dir.appendingPathComponent("sheet-\(world)-\(look).png"))
+                }
                 for pane in Pane.allCases {
                     let model = AppModel(fixture: fixture, pane: pane)
-                    let title = (pane.rawValue, pane == .history ? HistoryView.subtitle(model.actions) : "")
+                    let title = (pane.rawValue, "")
                     shoot(MainView().environmentObject(model), size: CGSize(width: 960, height: 640), appearance, title: title,
                           dir.appendingPathComponent("window-\(pane.rawValue.lowercased())-\(world)-\(look).png"))
                 }

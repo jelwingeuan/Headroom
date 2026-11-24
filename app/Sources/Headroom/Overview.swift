@@ -31,7 +31,7 @@ struct Overview {
         kept = all.filter { !$0.canFree }
         defaults = Set(freeable.filter { $0.info.unticked == nil }.map(\.path))
         for section in Kind.Section.allCases {
-            let rows = freeable.filter { $0.info.section == section }
+            let rows = freeable.filter { $0.section == section }
             guard !rows.isEmpty else { continue }
             var nodes: [Node]
             if section == .projects {
@@ -140,11 +140,17 @@ private struct Header: View {
         let sum = { (rows: [Candidate]) in rows.reduce(Int64(0)) { $0 + $1.bytes } }
         let here = sum(list.freeable.filter(\.freesHost)), docker = sum(list.freeable.filter { !$0.freesHost }), kept = sum(list.kept)
         VStack(alignment: .leading, spacing: 8) {
-            Text(status.totalsAt == nil ? "Measuring your folders…" : list.freeable.isEmpty ? "Nothing can go right now" :
-                    "\(list.freeable.count) \(list.freeable.count == 1 ? "folder" : "folders") can go, \(bytes(here)) on this Mac"
-                    + (docker > 0 ? " and \(bytes(docker)) in Docker" : ""))
-                .font(.largeTitle.weight(.bold)).monospacedDigit()
-            Text(subline(kept)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 12) {
+                Text(status.totalsAt == nil ? "Measuring your folders…" : list.freeable.isEmpty ? "Nothing can go right now" : "\(bytes(here)) can go")
+                    .font(.largeTitle.weight(.bold)).monospacedDigit()
+                if status.totalsAt == nil || model.working { ProgressView().controlSize(.small) }
+            }
+            Text(subline(list.freeable.count, docker, kept)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if let next = status.next, let f = status.freeBytes, let b = status.budgetBytes, f < b, !status.dryRun {
+                // The window says what the menu says: Headroom is working right now.
+                Label("\(bytes(b - f)) below your budget. Freeing \(bytes(next.bytes)) from \(next.name) now.", systemImage: "gauge.badge.minus")
+                    .foregroundStyle(Color.headroom)
+            }
             if status.budgetBytes == 0 {
                 Button("Set a Budget…") { model.pane = .settings }.buttonStyle(.borderedProminent).tint(.headroom)
             }
@@ -156,11 +162,12 @@ private struct Header: View {
         .accessibilityElement(children: .contain)
     }
 
-    private func subline(_ kept: Int64) -> String {
+    private func subline(_ count: Int, _ docker: Int64, _ kept: Int64) -> String {
         if status.totalsAt == nil {
             return "Headroom's first check lists every folder it could free, and every one it keeps. It takes a minute or two."
         }
-        var parts = [kept > 0 ? "\(bytes(kept)) is protected." : nil]
+        var parts = [count > 0 ? "\(count) \(count == 1 ? "folder" : "folders")\(docker > 0 ? ", plus \(bytes(docker)) inside Docker" : "")." : nil,
+                     kept > 0 ? "\(bytes(kept)) is protected." : nil]
         if let at = status.totalsAt { parts.append("Measured \(ago(at)).") }
         if status.dryRun { parts.append("Dry run: deleting only records what would go.") }
         return parts.compactMap { $0 }.joined(separator: " ")
@@ -225,18 +232,26 @@ struct ItemRow: View {
             }
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
-                    Text(inCard ? (item.path as NSString).lastPathComponent : item.name).font(.body.monospaced())
+                    Text(inCard ? item.inProject : item.name).font(.body.monospaced())
+                        .foregroundStyle(item.dryRun ? .secondary : .primary) // a dry-run row: nothing was deleted
                     if !inCard {
                         Text(item.place).foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
                     }
                 }
                 HStack(spacing: 6) {
                     Tag(text: item.what, dot: item.info.color)
-                    if item.canFree || item.date != nil { ForEach(item.tags.filter { $0 != item.what }.prefix(3), id: \.self) { Tag(text: $0) } }
+                    if item.canFree || item.date != nil {
+                        Text(item.tags.filter { $0 != item.what }.prefix(3).joined(separator: " · ")).foregroundStyle(.secondary).lineLimit(1)
+                    }
                 }
+                .font(.subheadline)
                 if let note {
-                    Text(note).font(.subheadline).foregroundStyle(item.canFree && tick != nil ? Color.orange : .primary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    if item.canFree && tick != nil { // unticked by default: a caution, said once
+                        Label { Text(note) } icon: { Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange) }
+                            .font(.subheadline).fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text(note).font(.subheadline).fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             }
             Spacer(minLength: 8)
@@ -275,7 +290,7 @@ private struct Tag: View {
             if let dot { Circle().fill(dot).frame(width: 6, height: 6) }
             Text(text).lineLimit(1)
         }
-        .font(.caption).padding(.horizontal, 6).padding(.vertical, 2)
+        .padding(.horizontal, 6).padding(.vertical, 1)
         .background(.quaternary.opacity(0.6), in: Capsule())
     }
 }
@@ -312,25 +327,30 @@ struct ConfirmSheet: View {
         let total = rows.reduce(Int64(0)) { $0 + $1.bytes }
         let loss = rows.filter { $0.kind == "simulator" }
         VStack(alignment: .leading, spacing: 12) {
-            Text(dryRun ? "Record \(bytes(total)) as a dry run?" : "Delete \(rows.count) \(rows.count == 1 ? "folder" : "folders"), \(bytes(total))?")
+            Text("\(dryRun ? "Would delete" : "Delete") \(rows.count) \(rows.count == 1 ? "folder" : "folders"), \(bytes(total))\(dryRun ? "" : "?")")
                 .font(.title2.weight(.semibold))
             Text(dryRun ? "It's the dry run week, so nothing is deleted. History lists these as what Headroom would delete."
-                 : "Headroom checks each folder again just before deleting it. Each one is listed in History, where Rebuild brings it back. \(rebuildTime).")
+                 : "Headroom checks each folder again just before deleting it. Each one is listed in History, where one click brings it back: Rebuild runs its install or build again, and Download Again fetches a model. \(rebuildTime).")
                 .fixedSize(horizontal: false, vertical: true)
-            ScrollView {
-                VStack(spacing: 6) {
-                    ForEach(rows) { r in
-                        HStack {
-                            Text(r.name == (r.path as NSString).lastPathComponent ? r.name : "\(r.name)/\((r.path as NSString).lastPathComponent)")
-                                .font(.body.monospaced())
-                            Text(r.place).foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
-                            Spacer()
-                            Text(bytes(r.bytes)).monospacedDigit()
-                        }
+            VStack(spacing: 6) { // every row it acts on, or the largest seven and what's left, never a silent cut
+                let shown = rows.count > 8 ? Array(rows.prefix(7)) : rows
+                ForEach(shown) { r in
+                    HStack {
+                        Text(r.name).font(.body.monospaced()).lineLimit(1)
+                        Text(r.what).foregroundStyle(.secondary).lineLimit(1)
+                        Spacer()
+                        Text(bytes(r.bytes)).monospacedDigit()
+                    }
+                }
+                if shown.count < rows.count {
+                    let rest = rows.dropFirst(shown.count)
+                    HStack {
+                        Text("and \(rest.count) more folders").foregroundStyle(.secondary)
+                        Spacer()
+                        Text(bytes(rest.reduce(0) { $0 + $1.bytes })).monospacedDigit().foregroundStyle(.secondary)
                     }
                 }
             }
-            .frame(maxHeight: 180)
             if !dryRun && !loss.isEmpty {
                 Label("\(loss.count) iOS \(loss.count == 1 ? "simulator comes" : "simulators come") back blank: their apps and test data can't be rebuilt.",
                       systemImage: "exclamationmark.triangle")
@@ -338,7 +358,7 @@ struct ConfirmSheet: View {
             HStack {
                 Spacer()
                 Button("Cancel", role: .cancel) { dismiss() }.keyboardShortcut(.cancelAction)
-                Button(dryRun ? "Record" : "Delete \(bytes(total))", role: .destructive) { go(); dismiss() }
+                Button(dryRun ? "Record in History" : "Delete \(bytes(total))", role: .destructive) { go(); dismiss() }
                     .keyboardShortcut(.defaultAction)
             }
         }
@@ -348,9 +368,13 @@ struct ConfirmSheet: View {
 
     /// From History's timed rebuilds of these folders, when there are any.
     private var rebuildTime: String {
-        let timed = rows.compactMap { r in history.first { $0.path == r.path && $0.rebuildSecs != nil }?.rebuildSecs }
-        guard !timed.isEmpty else { return "A rebuild usually takes a few minutes and may download packages" }
-        let d = Duration.seconds(timed.reduce(0, +)).formatted(.units(allowed: [.hours, .minutes], width: .wide, maximumUnitCount: 2).locale(Locale(identifier: "en")))
-        return "Rebuilding the \(timed.count) timed before took \(d)" + (timed.count < rows.count ? "; the rest usually take a few minutes each" : "")
+        let timed = rows.compactMap { r in history.first { $0.path == r.path && $0.rebuildSecs != nil } }
+        guard let first = timed.first else { return "A rebuild usually takes a few minutes and may download packages" }
+        if timed.count == 1 {
+            let d = Duration.seconds(first.rebuildSecs ?? 0).formatted(.units(allowed: [.hours, .minutes], width: .wide).locale(Locale(identifier: "en")))
+            return "Last time, rebuilding \(first.name) took \(d); the others usually take a few minutes each"
+        }
+        let d = Duration.seconds(timed.compactMap(\.rebuildSecs).reduce(0, +)).formatted(.units(allowed: [.hours, .minutes], width: .wide, maximumUnitCount: 2).locale(Locale(identifier: "en")))
+        return "Last time, rebuilding \(timed.count) of these took \(d) in all" + (timed.count < rows.count ? "; the others usually take a few minutes each" : "")
     }
 }

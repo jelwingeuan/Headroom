@@ -69,17 +69,19 @@ struct HistoryView: View {
                            detail: "When Headroom frees space, each folder shows up here, and you can rebuild it with one click.",
                            action: model.status.budgetBytes == 0 ? ("Set a Budget…", { model.pane = .settings }) : nil)
             } else {
-                List(rows) { a in
+                List {
+                    Text(Self.subtitle(model.actions)).font(.title3).monospacedDigit().padding(.vertical, 8) // M7: the parts add up
+                    ForEach(rows) { a in
                     let busy = model.undoing.contains(a.id)
                     ItemRow(item: a, note: status(a, busy),
                             buttons: a.dryRun || a.undone || busy ? [] : [("\(a.rebuildVerb)…", { asking = a })])
+                    }
                 }
                 .listStyle(.inset(alternatesRowBackgrounds: false))
                 .accessibilityLabel("Deleted folders")
             }
         }
         .navigationTitle("History")
-        .navigationSubtitle(Self.subtitle(model.actions))
         .confirmationDialog(asking.map { "\($0.rebuildVerb) \($0.name)?" } ?? "",
                             isPresented: Binding(get: { asking != nil }, set: { if !$0 { asking = nil } }),
                             presenting: asking) { action in
@@ -104,7 +106,7 @@ struct HistoryView: View {
         let sum = { (rows: [Candidate]) in rows.reduce(Int64(0)) { $0 + $1.bytes } }
         let freed = sum(done.filter { !$0.undone && $0.freesHost }), rebuilt = sum(done.filter(\.undone))
         let docker = sum(done.filter { !$0.undone && !$0.freesHost })
-        return ["\(bytes(freed)) still freed", rebuilt > 0 ? "\(bytes(rebuilt)) rebuilt" : nil,
+        return ["\(bytes(freed)) still freed on this Mac", rebuilt > 0 ? "\(bytes(rebuilt)) rebuilt" : nil,
                 docker > 0 ? "\(bytes(docker)) inside Docker" : nil].compactMap { $0 }.joined(separator: " · ")
     }
 
@@ -154,7 +156,7 @@ struct SettingsView: View {
                             Text("GB free")
                         }
                     }
-                    Picker("Leave projects alone for", selection: binding.recentDays) {
+                    Picker("Leave projects alone for (days)", selection: binding.recentDays) {
                         ForEach([7, 14, 30, 60, 90], id: \.self) { Text("\($0)").tag($0) }
                         if ![7, 14, 30, 60, 90].contains(binding.wrappedValue.recentDays) {
                             Text("\(binding.wrappedValue.recentDays) days").tag(binding.wrappedValue.recentDays)

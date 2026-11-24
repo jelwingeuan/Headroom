@@ -237,8 +237,8 @@ struct LastCheck {
         acted = !freed.isEmpty || shared > 0
         let error = reply.error ?? events.first(where: { $0.string("event") == "error" })?.string("error")
         failed = error != nil
-        if let error {
-            text = "Couldn't check: \(error)"
+        if failed {
+            text = "Last check failed" // the menu says why, once, in its warning above
         } else if let first = freed.first {
             text = "Freed \(bytes(freed.reduce(0) { $0 + $1.bytes })) from \(first.name)\(more(freed))"
         } else if shared > 0 {

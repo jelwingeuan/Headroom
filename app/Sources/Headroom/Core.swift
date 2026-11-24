@@ -121,9 +121,13 @@ struct Candidate: Equatable, Identifiable {
 
     var shortPath: String { (path as NSString).abbreviatingWithTildeInPath }
     /// The folder that holds it, e.g. "~/code/app" for "~/code/app/node_modules".
-    var place: String { (shortPath as NSString).deletingLastPathComponent }
+    var place: String { path.hasPrefix("/") ? (shortPath as NSString).deletingLastPathComponent : "" } // "docker://…" has none
     /// "app" for ~/code/app/node_modules; "Foo-abc" for DerivedData/Foo-abc.
     var name: String {
+        // A simulator's folder is a UUID; people know it by its device, which the reason names.
+        if kind == "simulator", let device = reason?.range(of: #"(iPhone|iPad|Apple Watch|Apple TV|Apple Vision)[^;]*?simulator"#, options: .regularExpression) {
+            return String(reason![device])
+        }
         let last = (path as NSString).lastPathComponent
         if last == kind { return (place as NSString).lastPathComponent }
         // Xcode names DerivedData folders "<Project>-<28-letter hash>"; people know the project.
@@ -133,6 +137,13 @@ struct Candidate: Equatable, Identifiable {
     }
 
     var info: Kind { Kind(kind) }
+    /// Its project card when the scan knows the project, else its kind's section.
+    var section: Kind.Section { project != nil ? .projects : info.section }
+    /// Where it sits inside its project: "web/node_modules" in game; else its folder name.
+    var inProject: String {
+        guard let project, path.hasPrefix(project + "/") else { return name }
+        return String(path.dropFirst(project.count + 1))
+    }
     /// The kind in plain words, for people who don't know the tool's folder names.
     var what: String { info.label }
 
@@ -205,13 +216,13 @@ struct Kind {
         case "xcode_archive": (label, group, section, color) = ("Xcode archive", "Xcode", .xcode, .blue)
         case "simulator":
             (label, group, section, color) = ("iOS simulator", "Xcode", .xcode, .blue)
-            unticked = "Left unticked: its apps and test data can't come back, and Undo gives a blank device."
+            unticked = "Left unticked: its apps and test data can't come back; Recreate gives a blank device."
         case "model", "ollama", "hf", "ollama_model", "hf_model", "lmstudio_model":
             (label, group, section, color) = ("AI model", "AI models", .models, .purple)
-        case "claude_code_old": (label, group, section, color) = ("Old Claude Code version", "AI-tool leftovers", .aiTools, .pink)
-        case "codex_temp": (label, group, section, color) = ("Codex temporary files", "AI-tool leftovers", .aiTools, .pink)
-        case "app_cache", "electron_cache": (label, group, section, color) = ("App cache", "AI-tool leftovers", .aiTools, .pink)
-        case "ai_history": (label, group, section, color) = ("AI conversation history", "AI-tool leftovers", .aiTools, .pink)
+        case "claude_code_old": (label, group, section, color) = ("Old Claude Code version", "AI-tool leftovers", .aiTools, .brown)
+        case "codex_temp": (label, group, section, color) = ("Codex temporary files", "AI-tool leftovers", .aiTools, .brown)
+        case "app_cache", "electron_cache": (label, group, section, color) = ("App cache", "AI-tool leftovers", .aiTools, .brown)
+        case "ai_history": (label, group, section, color) = ("AI conversation history", "AI-tool leftovers", .aiTools, .brown)
         case "docker_images", "docker_build_cache":
             (label, group, section, color) = (kind == "docker_images" ? "Docker images" : "Docker build cache", "Docker", .docker, .cyan)
             unticked = "Left unticked: this frees space inside Docker's own disk, not on this Mac's."
@@ -223,4 +234,8 @@ struct Kind {
 /// "2 hours ago", in English like every other word in the app, whatever the Mac's region.
 func ago(_ d: Date) -> String { d.formatted(.relative(presentation: .named).locale(Locale(identifier: "en"))) }
 
-func bytes(_ n: Int64) -> String { ByteCountFormatter.string(fromByteCount: n, countStyle: .file) }
+func bytes(_ n: Int64) -> String {
+    let f = ByteCountFormatter()
+    f.allowsNonnumericFormatting = false // "0 KB", never "Zero KB"
+    return f.string(fromByteCount: n)
+}
