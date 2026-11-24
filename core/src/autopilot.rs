@@ -40,22 +40,15 @@ pub fn tick(ctx: &Ctx, budget: u64, emit: &mut dyn FnMut(Json)) -> bool {
         let stale = st.get("totals").and_then(|t| t.get("at")).and_then(Json::u64).map_or(true, |t| t + DAY <= ctx.now);
         let mut last = None;
         if stale {
-            match scan::scan(ctx, &ctx.home) {
-                Ok(mut s) => {
-                    st.set("permission_errors", s.denied);
-                    scan::size_kept(&mut s.cands);
-                    let mut list = kept(&s.cands);
-                    list.extend(s.cands.iter().filter(|c| c.reclaimable() && c.frees_host).map(Measured::free));
-                    st.set("totals", totals(&list, ctx.now));
-                    last = Some(last_scan(list, ctx.now));
-                }
+            match scan_home(ctx) {
+                Ok(s) => last = Some(measure(&mut st, &s, &[], ctx.now)),
                 Err(e) => emit(obj! {"event" => "error", "error" => e}),
             }
         }
         save(ctx, st, last);
         return true;
     }
-    let mut s = match scan::scan(ctx, &ctx.home) {
+    let s = match scan_home(ctx) {
         Ok(s) => s,
         Err(e) => {
             emit(obj! {"event" => "error", "error" => e});
@@ -69,11 +62,8 @@ pub fn tick(ctx: &Ctx, budget: u64, emit: &mut dyn FnMut(Json)) -> bool {
         .filter_map(|c| Some((c.project.clone()?, ctx.now)))
         .collect();
     state::observe(ctx, &busy);
-    st.set("permission_errors", s.denied);
-    scan::size_kept(&mut s.cands);
-    let mut list = kept(&s.cands);
     let groups = shrink::duplicate_groups(&s.cands);
-    let mut pool: Vec<Cand> = s.cands.into_iter().filter(|c| c.reclaimable() && c.frees_host).collect();
+    let mut pool: Vec<Cand> = s.cands.iter().filter(|c| c.reclaimable() && c.frees_host).cloned().collect();
     pool.sort_by_key(|c| (c.active.unwrap_or(0), std::cmp::Reverse(c.bytes)));
 
     // Shrink before deleting: identical copies of one project's dependencies become clones.
@@ -136,11 +126,28 @@ pub fn tick(ctx: &Ctx, budget: u64, emit: &mut dyn FnMut(Json)) -> bool {
     let next = pool.get(i).map(|c| obj! {"path" => &c.path, "kind" => &c.kind, "bytes" => c.bytes, "reason" => &c.why});
     st.set("next", next);
     // For the menu: what could still come back, and what is kept and why.
-    list.extend(pool.iter().filter(|c| !freed_paths.contains(&c.path)).map(Measured::free));
-    st.set("totals", totals(&list, ctx.now));
+    let last = measure(&mut st, &s, &freed_paths, ctx.now);
     st.set("snapshot_holding", crate::machine::snapshot_holding());
-    save(ctx, st, Some(last_scan(list, ctx.now)));
+    save(ctx, st, Some(last));
     true
+}
+
+/// A scan of home with the folders it keeps sized too, as the totals need.
+fn scan_home(ctx: &Ctx) -> Result<scan::Scan, String> {
+    let mut s = scan::scan(ctx, &ctx.home)?;
+    scan::size_kept(&mut s.cands);
+    Ok(s)
+}
+
+/// Sets `status`'s totals (and the scan's permission errors) in `st` and returns
+/// last-scan.json, both from one scan minus the folders just reclaimed (`gone`).
+fn measure(st: &mut Json, s: &scan::Scan, gone: &[PathBuf], now: u64) -> Json {
+    st.set("permission_errors", s.denied);
+    let mut list = kept(&s.cands);
+    let free = s.cands.iter().filter(|c| c.reclaimable() && c.frees_host && !gone.contains(&c.path));
+    list.extend(free.map(Measured::free));
+    st.set("totals", totals(&list, now));
+    last_scan(list, now)
 }
 
 /// One folder a tick's totals count: `free` when autopilot could still reclaim it.
