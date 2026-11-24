@@ -139,7 +139,7 @@ struct Candidate: Equatable, Identifiable {
     /// The scan's reason split into its clauses, minus the project marker ("Rust project
     /// (Cargo.toml)") the card already shows: "git ignores it", "last used 41 days ago"…
     var tags: [String] {
-        let parts = (reason ?? "").components(separatedBy: "; ").filter { !$0.isEmpty }
+        let parts = (reason ?? "").replacingOccurrences(of: NSHomeDirectory(), with: "~").components(separatedBy: "; ").filter { !$0.isEmpty }
         return parts.first?.contains(" project (") == true ? Array(parts.dropFirst()) : parts
     }
 

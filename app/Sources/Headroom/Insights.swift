@@ -555,7 +555,7 @@ struct Tallies: View {
     private func rebuilt(_ t: Insights.Tally) -> String {
         guard t.rebuilt > 0 else { return "None" }
         let time = t.rebuildSecs.map {
-            Duration.seconds($0).formatted(.units(allowed: [.hours, .minutes, .seconds], width: .abbreviated, maximumUnitCount: 2))
+            Duration.seconds($0).formatted(.units(allowed: [.hours, .minutes, .seconds], width: .abbreviated, maximumUnitCount: 2).locale(Locale(identifier: "en")))
         }
         return "\(t.rebuilt) · \(time ?? "time not recorded")"
     }

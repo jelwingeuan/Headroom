@@ -203,6 +203,13 @@ enum Screens {
                 guard world != "error" else { continue }
                 shoot(SettingsView().environmentObject(menu), size: nil, appearance,
                       dir.appendingPathComponent("settings-\(world)-\(look).png"))
+                // The whole Overview list, Protected open, and the sheet its button opens.
+                let overview = AppModel(fixture: fixture, pane: .overview)
+                shoot(OverviewView().environmentObject(overview), size: CGSize(width: 760, height: 1900), appearance,
+                      dir.appendingPathComponent("overview-full-\(world)-\(look).png"))
+                let picks = Overview(overview.breakdown).freeable.filter { $0.info.unticked == nil }
+                shoot(ConfirmSheet(rows: picks, dryRun: overview.status.dryRun, history: overview.actions) {}, size: nil, appearance,
+                      dir.appendingPathComponent("sheet-\(world)-\(look).png"))
                 for pane in Pane.allCases {
                     let model = AppModel(fixture: fixture, pane: pane)
                     let title = (pane.rawValue, pane == .history ? HistoryView.subtitle(model.actions) : "")

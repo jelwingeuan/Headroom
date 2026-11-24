@@ -53,7 +53,7 @@ struct OverviewView: View {
     /// nil until the person ticks something: the defaults stand until then.
     @State private var ticked: Set<String>?
     @State private var selection = Set<String>()
-    @State private var showKept = false
+    @State private var showKept = Screens.rendering // renders show why each is kept
     @State private var confirming = false
 
     var body: some View {
@@ -81,7 +81,7 @@ struct OverviewView: View {
             if !list.kept.isEmpty {
                 Section {
                     DisclosureGroup(isExpanded: $showKept.animation(.headroom)) {
-                        ForEach(list.kept) { ItemRow(item: $0, note: $0.reason.map { "Kept: \($0)" }).tag($0.path) }
+                        ForEach(list.kept) { ItemRow(item: $0, note: $0.reason.map { "Kept: \($0.replacingOccurrences(of: NSHomeDirectory(), with: "~"))" }).tag($0.path) }
                     } label: {
                         Text("\(list.kept.count) folders Headroom won't delete, and why").foregroundStyle(.secondary)
                     }
@@ -232,7 +232,7 @@ struct ItemRow: View {
                 }
                 HStack(spacing: 6) {
                     Tag(text: item.what, dot: item.info.color)
-                    ForEach(item.tags.prefix(3), id: \.self) { Tag(text: $0) }
+                    if item.canFree || item.date != nil { ForEach(item.tags.filter { $0 != item.what }.prefix(3), id: \.self) { Tag(text: $0) } }
                 }
                 if let note {
                     Text(note).font(.subheadline).foregroundStyle(item.canFree && tick != nil ? Color.orange : .primary)
@@ -303,7 +303,7 @@ private struct BottomBar: View {
 }
 
 /// Exactly what goes, that History's Rebuild brings it back, and how long that takes.
-private struct ConfirmSheet: View {
+struct ConfirmSheet: View {
     let rows: [Candidate], dryRun: Bool, history: [Candidate]
     let go: () -> Void
     @Environment(\.dismiss) private var dismiss
@@ -321,7 +321,8 @@ private struct ConfirmSheet: View {
                 VStack(spacing: 6) {
                     ForEach(rows) { r in
                         HStack {
-                            Text(r.name).font(.body.monospaced())
+                            Text(r.name == (r.path as NSString).lastPathComponent ? r.name : "\(r.name)/\((r.path as NSString).lastPathComponent)")
+                                .font(.body.monospaced())
                             Text(r.place).foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
                             Spacer()
                             Text(bytes(r.bytes)).monospacedDigit()
@@ -349,7 +350,7 @@ private struct ConfirmSheet: View {
     private var rebuildTime: String {
         let timed = rows.compactMap { r in history.first { $0.path == r.path && $0.rebuildSecs != nil }?.rebuildSecs }
         guard !timed.isEmpty else { return "A rebuild usually takes a few minutes and may download packages" }
-        let d = Duration.seconds(timed.reduce(0, +)).formatted(.units(allowed: [.hours, .minutes], width: .wide, maximumUnitCount: 2))
+        let d = Duration.seconds(timed.reduce(0, +)).formatted(.units(allowed: [.hours, .minutes], width: .wide, maximumUnitCount: 2).locale(Locale(identifier: "en")))
         return "Rebuilding the \(timed.count) timed before took \(d)" + (timed.count < rows.count ? "; the rest usually take a few minutes each" : "")
     }
 }
