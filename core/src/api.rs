@@ -201,6 +201,9 @@ fn digest(ctx: &Ctx) -> Json {
     let would: u64 = state::read_lines(&ctx.file("dryrun.jsonl"))
         .iter()
         .filter(|d| recent(d))
+        // A Docker pick in the dry run would free nothing on this disk; rows from before the
+        // field existed are all host rows.
+        .filter(|d| d.get("frees_host").and_then(Json::bool).unwrap_or(true))
         .filter_map(|d| d.get("bytes")?.u64())
         .sum();
     let st = state::load_state(ctx);
@@ -629,5 +632,17 @@ case "$1 $2" in "system df") echo '{{"Type":"Build Cache","Reclaimable":"1.5GB"}
         assert!(paths.contains(&b.to_string_lossy().into_owned()), "{after}");
         let free_after = status(&ctx).get("reclaimable_bytes").and_then(Json::u64).unwrap();
         assert!(free_after + (1 << 20) <= free_before, "{free_before} -> {free_after}");
+    }
+
+    #[test]
+    fn digest_would_bytes_leave_out_docker_dry_run_picks() {
+        let ctx = crate::testutil::ctx("api-digest-docker");
+        state::log_dry_run(
+            &ctx,
+            obj! {"at" => ctx.now, "path" => "/x/node_modules", "kind" => "node_modules", "bytes" => 5u64, "dry_run" => true},
+        );
+        let docker = obj! {"at" => ctx.now, "path" => "docker://build-cache", "kind" => "docker_build_cache", "bytes" => 7u64, "dry_run" => true, "frees_host" => false};
+        state::log_dry_run(&ctx, docker);
+        assert_eq!(digest(&ctx).get("would_bytes").and_then(Json::u64), Some(5));
     }
 }

@@ -125,7 +125,7 @@ fn reclaim_one(ctx: &Ctx, c: &Cand, dry: bool, origin: &str, emit: &mut dyn FnMu
         let e = obj! {"event" => "would_reclaim", "path" => &c.path, "kind" => &c.kind, "bytes" => c.bytes, "reason" => &c.why};
         state::log_dry_run(
             ctx,
-            obj! {"at" => ctx.now, "path" => &c.path, "kind" => &c.kind, "bytes" => c.bytes, "dry_run" => true},
+            obj! {"at" => ctx.now, "path" => &c.path, "kind" => &c.kind, "bytes" => c.bytes, "dry_run" => true, "frees_host" => c.frees_host},
         );
         emit(e);
         return Some(c.bytes);
