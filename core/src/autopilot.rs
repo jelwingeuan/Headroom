@@ -84,29 +84,14 @@ pub fn tick(ctx: &Ctx, budget: u64, emit: &mut dyn FnMut(Json)) -> bool {
         while got < need && i < pool.len() {
             let c = &pool[i];
             i += 1;
-            if dry {
-                let e = obj! {"event" => "would_reclaim", "path" => &c.path, "kind" => &c.kind, "bytes" => c.bytes, "reason" => &c.why};
-                state::log_dry_run(
-                    ctx,
-                    obj! {"at" => ctx.now, "path" => &c.path, "kind" => &c.kind, "bytes" => c.bytes, "dry_run" => true},
-                );
-                emit(e);
-                got += c.bytes;
-                continue;
-            }
-            match reclaim::reclaim(ctx, c, "autopilot") {
-                Ok(a) => {
-                    let bytes = a.get("bytes").and_then(Json::u64).unwrap_or(0);
-                    emit(
-                        obj! {"event" => "reclaim", "id" => a.s("id"), "path" => &c.path, "kind" => &c.kind, "bytes" => bytes},
-                    );
+            match reclaim_one(ctx, c, dry, "autopilot", emit) {
+                Some(bytes) => {
                     got += bytes;
-                    freed_paths.push(c.path.clone());
+                    if !dry {
+                        freed_paths.push(c.path.clone());
+                    }
                 }
-                Err(e) => {
-                    failed += c.bytes;
-                    emit(obj! {"event" => "skip", "path" => &c.path, "kind" => &c.kind, "reason" => e});
-                }
+                None => failed += c.bytes,
             }
         }
         free = if dry { free + got } else { settle(ctx, budget) };
@@ -130,6 +115,34 @@ pub fn tick(ctx: &Ctx, budget: u64, emit: &mut dyn FnMut(Json)) -> bool {
     st.set("snapshot_holding", crate::machine::snapshot_holding());
     save(ctx, st, Some(last));
     true
+}
+
+/// Reclaims one candidate through `reclaim::reclaim` (which checks it again from scratch), or
+/// in the dry run only logs it, and reports which through `emit`. Returns the bytes freed (that
+/// would be, in the dry run), or None when the recheck refused it.
+fn reclaim_one(ctx: &Ctx, c: &Cand, dry: bool, origin: &str, emit: &mut dyn FnMut(Json)) -> Option<u64> {
+    if dry {
+        let e = obj! {"event" => "would_reclaim", "path" => &c.path, "kind" => &c.kind, "bytes" => c.bytes, "reason" => &c.why};
+        state::log_dry_run(
+            ctx,
+            obj! {"at" => ctx.now, "path" => &c.path, "kind" => &c.kind, "bytes" => c.bytes, "dry_run" => true},
+        );
+        emit(e);
+        return Some(c.bytes);
+    }
+    match reclaim::reclaim(ctx, c, origin) {
+        Ok(a) => {
+            let bytes = a.get("bytes").and_then(Json::u64).unwrap_or(0);
+            emit(
+                obj! {"event" => "reclaim", "id" => a.s("id"), "path" => &c.path, "kind" => &c.kind, "bytes" => bytes},
+            );
+            Some(bytes)
+        }
+        Err(e) => {
+            emit(obj! {"event" => "skip", "path" => &c.path, "kind" => &c.kind, "reason" => e});
+            None
+        }
+    }
 }
 
 /// The `rescan` op: the scan and listing a tick saves, made now; nothing is reclaimed.
