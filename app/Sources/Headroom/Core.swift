@@ -236,6 +236,10 @@ struct Kind {
 func ago(_ d: Date) -> String { d.formatted(.relative(presentation: .named).locale(Locale(identifier: "en"))) }
 
 func bytes(_ n: Int64) -> String {
+    if n >= 1_000_000_000 { // one decimal at most, everywhere: "54.6 GB", "7 GB"
+        let gb = (Double(n) / 1e9 * 10).rounded() / 10
+        return gb.formatted(.number.precision(.fractionLength(0...1)).locale(Locale(identifier: "en"))) + " GB"
+    }
     let f = ByteCountFormatter()
     f.allowsNonnumericFormatting = false // "0 KB", never "Zero KB"
     return f.string(fromByteCount: n)

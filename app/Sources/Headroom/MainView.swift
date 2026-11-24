@@ -36,7 +36,7 @@ struct MainView: View {
                 VStack(alignment: .leading, spacing: 16) {
                     Text("How Headroom decides").font(.title.weight(.bold))
                     About(recentDays: model.settings?.recentDays ?? 14)
-                    Text("\(version) · MIT License · No account, no telemetry").font(.caption).foregroundStyle(.secondary)
+                    Text("\(version) · MIT License").font(.caption).foregroundStyle(.secondary)
                 }
                 .padding(24).frame(maxWidth: 640, alignment: .leading)
             }
@@ -77,8 +77,7 @@ struct HistoryView: View {
                            action: model.status.budgetBytes == 0 ? ("Set a Budget…", { model.pane = .settings }) : nil)
             } else {
                 List {
-                    Text(Self.subtitle(model.actions).isEmpty ? "Nothing deleted. \(bytes(rows.filter(\.dryRun).reduce(0) { $0 + $1.bytes })) would have gone in the dry run."
-                         : Self.subtitle(model.actions)).font(.title3).monospacedDigit().padding(.vertical, 8) // M7: the parts add up
+                    HistoryHeader(actions: model.actions, status: model.status).monospacedDigit().padding(.vertical, 8) // M7: the parts add up
                     ForEach(rows) { a in
                     let busy = model.undoing.contains(a.id)
                     ItemRow(item: a, note: status(a, busy),
@@ -103,19 +102,9 @@ struct HistoryView: View {
     private func status(_ a: Candidate, _ busy: Bool) -> String {
         let when = a.date.map(ago) ?? "at an unknown time"
         if busy { return "Rebuilding…" }
+        if !a.freesHost && !a.dryRun { return "Deleted \(when). Docker rebuilds this cache on its next build." }
         if a.dryRun { return "Dry run: would have been deleted \(when). Nothing was deleted." }
         return a.undone ? "Deleted \(when), and rebuilt since." : "Deleted \(when)."
-    }
-
-    /// M7: the parts add up to the rows. What is still freed, what was rebuilt, what was inside Docker.
-    static func subtitle(_ actions: [Candidate]) -> String {
-        let done = actions.filter { !$0.dryRun }
-        guard !done.isEmpty else { return "" }
-        let sum = { (rows: [Candidate]) in rows.reduce(Int64(0)) { $0 + $1.bytes } }
-        let freed = sum(done.filter { !$0.undone && $0.freesHost }), rebuilt = sum(done.filter(\.undone))
-        let docker = sum(done.filter { !$0.undone && !$0.freesHost })
-        return ["\(bytes(freed)) still freed on this Mac", rebuilt > 0 ? "\(bytes(rebuilt)) rebuilt" : nil,
-                docker > 0 ? "\(bytes(docker)) inside Docker" : nil].compactMap { $0 }.joined(separator: " · ")
     }
 
     private func rebuildMessage(_ a: Candidate) -> String {
@@ -124,6 +113,31 @@ struct HistoryView: View {
         text += " It can take a few minutes and may download from the internet."
         if let loss = a.dataLoss { text += " It can't bring back everything: \(loss)." }
         return text
+    }
+}
+
+/// History's summary in the Overview's style: one large figure, the parts that add up to it below.
+private struct HistoryHeader: View {
+    let actions: [Candidate]
+    let status: Status
+
+    var body: some View {
+        let done = actions.filter { !$0.dryRun }
+        let sum = { (rows: [Candidate]) in rows.reduce(Int64(0)) { $0 + $1.bytes } }
+        let freed = sum(done.filter { !$0.undone && $0.freesHost }), rebuilt = sum(done.filter(\.undone))
+        let docker = sum(done.filter { !$0.undone && !$0.freesHost })
+        VStack(alignment: .leading, spacing: 8) {
+            Text(done.isEmpty ? "Nothing deleted yet" : "\(bytes(freed)) freed").font(.largeTitle.weight(.bold)).monospacedDigit()
+            Text(done.isEmpty ? "\(bytes(sum(actions.filter(\.dryRun)))) would have gone in the dry run."
+                 : ["Still free on this Mac.", rebuilt > 0 ? "\(bytes(rebuilt)) was rebuilt since." : nil,
+                    docker > 0 ? "\(bytes(docker)) was inside Docker's disk." : nil].compactMap { $0 }.joined(separator: " "))
+                .foregroundStyle(.secondary)
+            if let next = status.next, let f = status.freeBytes, let b = status.budgetBytes, f < b, !status.dryRun {
+                Label("Deleting \(next.name) now, \(bytes(next.bytes)). It's listed here when it's done.", systemImage: "gauge.badge.minus")
+                    .foregroundStyle(Color.headroom)
+            }
+        }
+        .padding(.vertical, 16)
     }
 }
 
@@ -172,7 +186,7 @@ struct SettingsView: View {
                     }
                     .pickerStyle(.menu)
                 } header: {
-                    Text("Free Space")
+                    Text("Free space")
                 } footer: {
                     Footnote(binding.wrappedValue.budgetBytes == 0
                         ? "Headroom deletes nothing until you set a budget."
@@ -181,11 +195,11 @@ struct SettingsView: View {
                 Section {
                     Toggle("Only show what Headroom would delete", isOn: binding.dryRun)
                 } header: {
-                    Text("Dry Run")
+                    Text("Dry run")
                 } footer: {
                     Footnote(binding.wrappedValue.dryRun
                         ? "Nothing is deleted while this is on. It's on for your first 7 days, and what it would delete is listed in History."
-                        : "Off: Headroom frees space for real, and every deletion appears in History.")
+                        : "Every deletion is listed in History, where Rebuild brings it back.")
                 }
             } else {
                 ProgressView("Loading settings…")
@@ -199,11 +213,12 @@ struct SettingsView: View {
                         Button("Open Login Items…") { SMAppService.openSystemSettingsLoginItems() }
                     }
                 }
-                LabeledContent("Full Disk Access") {
-                    Button("Full Disk Access Settings…") { openFullDiskAccessSettings() }
+                LabeledContent {
+                    Button("Open Settings…") { openFullDiskAccessSettings() }
+                } label: {
+                    Text("Full Disk Access")
+                    Text(model.status.needsFullDiskAccess ? "Off: some folders can't be measured" : "No folders are blocked")
                 }
-                Text(model.status.needsFullDiskAccess ? "Off: some folders can't be measured." : "No folders are blocked.")
-                    .foregroundStyle(.secondary)
             } header: {
                 Text("General")
             }

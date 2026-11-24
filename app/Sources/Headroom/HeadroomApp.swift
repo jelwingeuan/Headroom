@@ -400,7 +400,7 @@ struct LiveLine: View {
                     .foregroundStyle(last.acted ? Color.headroom : .secondary)
                     .frame(width: 20)
                 // M10: "2 minutes ago", never a bare "00:30" that reads like a duration.
-                let when = ago(last.at)
+                let when = ago(last.at).replacingOccurrences(of: " ", with: "\u{00A0}") // never "1 / second ago"
                 Text("\(last.text) · \(when)").lineLimit(2)
             }
         }

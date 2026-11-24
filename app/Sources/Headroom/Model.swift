@@ -251,7 +251,7 @@ struct LastCheck {
         } else if events.contains(where: { $0.string("event") == "shortfall" }) {
             text = "Below budget, and nothing left is safe to free"
         } else {
-            text = "Checked, nothing needed"
+            text = "Free space checked, nothing needed"
         }
     }
 }

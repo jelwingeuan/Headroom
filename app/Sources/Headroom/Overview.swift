@@ -86,7 +86,7 @@ struct OverviewView: View {
             if !list.kept.isEmpty {
                 Section {
                     DisclosureGroup(isExpanded: $showKept.animation(.headroom)) {
-                        ForEach(list.kept) { ItemRow(item: $0, note: $0.reason.map { "Kept: \($0.replacingOccurrences(of: NSHomeDirectory(), with: "~"))" }).tag($0.path) }
+                        ForEach(list.kept) { ItemRow(item: $0, note: $0.reason.map { "Kept: " + $0.replacingOccurrences(of: NSHomeDirectory(), with: "~").replacingOccurrences(of: ": ", with: " — ") }).tag($0.path) }
                     } label: {
                         Text("\(list.kept.count) folders Headroom won't delete, and why").foregroundStyle(.secondary)
                     }
@@ -147,7 +147,7 @@ private struct Header: View {
 
     var body: some View {
         let sum = { (rows: [Candidate]) in rows.reduce(Int64(0)) { $0 + $1.bytes } }
-        let host = list.freeable.filter(\.freesHost)
+        let host = list.freeable.filter { $0.freesHost && $0.path != list.freeing }
         let here = sum(host), docker = sum(list.freeable.filter { !$0.freesHost }), kept = sum(list.kept)
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 12) {
@@ -155,18 +155,28 @@ private struct Header: View {
                     .font(.largeTitle.weight(.bold)).monospacedDigit()
                 if status.totalsAt == nil || model.working { ProgressView().controlSize(.small) }
             }
-            Text(subline(host.count, docker, kept)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            if let next = status.next, let f = status.freeBytes, let b = status.budgetBytes, f < b, !status.dryRun {
-                // The window says what the menu says: Headroom is working right now.
-                Label("\(bytes(b - f)) below your budget. Freeing \(bytes(next.bytes)) from \(next.name) now.", systemImage: "gauge.badge.minus")
-                    .foregroundStyle(Color.headroom)
-            }
-            if status.needsFullDiskAccess {
-                Notice(symbol: "lock.shield", text: "Headroom can't see some folders yet, so this list may be short.",
-                       action: ("Full Disk Access Settings…", openFullDiskAccessSettings))
+            Text(subline(host.count, docker, kept, sum(host.filter { $0.info.unticked != nil }))).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            // The window says what the menu says about the budget, in the same words.
+            if let f = status.freeBytes, let b = status.budgetBytes, b > 0, f < b {
+                if let next = status.next, !status.dryRun {
+                    Label("\(bytes(b - f)) below your budget. Freeing \(bytes(next.bytes)) from \(next.name) now.", systemImage: "gauge.badge.minus")
+                        .foregroundStyle(Color.headroom)
+                } else if status.dryRun {
+                    let days = status.dryRunDaysLeft ?? 0
+                    Label("\(bytes(b - f)) below your budget. Dry run: nothing is deleted" + (days > 0 ? " for \(days) more \(days == 1 ? "day" : "days")." : "."),
+                          systemImage: "gauge.with.dots.needle.33percent")
+                }
             }
             if status.budgetBytes == 0 {
+                Text("Headroom deletes nothing until you set a budget.")
                 Button("Set a Budget…") { model.pane = .settings }.buttonStyle(.borderedProminent).tint(.headroom)
+            }
+            if status.needsFullDiskAccess {
+                HStack {
+                    Label("Headroom can't see some folders yet, so this list may be short.", systemImage: "lock.shield")
+                    Button("Full Disk Access Settings…", action: openFullDiskAccessSettings)
+                }
+                .foregroundStyle(.secondary)
             }
             if let f = status.freeBytes, let b = status.budgetBytes {
                 SpaceBar(capacity: status.capacityBytes ?? f, free: f, budget: b, canBeFreed: status.canComeBack,
@@ -177,15 +187,16 @@ private struct Header: View {
         .accessibilityElement(children: .contain)
     }
 
-    private func subline(_ count: Int, _ docker: Int64, _ kept: Int64) -> String {
+    private func subline(_ count: Int, _ docker: Int64, _ kept: Int64, _ unticked: Int64) -> String {
         if status.totalsAt == nil {
             return "Headroom's first check lists every folder it could free, and every one it keeps. It takes a minute or two."
         }
-        var parts = [status.freeBytes.map { f in "\(bytes(f)) free" + ((status.budgetBytes ?? 0) > 0 ? " of the \(bytes(status.budgetBytes!)) you keep." : ".") },
-                     count > 0 ? "\(count) \(count == 1 ? "folder" : "folders")\(docker > 0 ? ", plus \(bytes(docker)) inside Docker" : "")." : nil,
+        let b = status.budgetBytes ?? 0
+        var parts = [status.freeBytes.map { f in "\(bytes(f)) free" + (b == 0 ? "." : f >= b ? ", \(bytes(f - b)) above your \(bytes(b)) budget." : ".") },
+                     count > 0 ? "\(count) \(count == 1 ? "folder" : "folders")\(unticked > 0 ? ", \(bytes(unticked)) of it left unticked" : "")"
+                        + "\(docker > 0 ? ", plus \(bytes(docker)) inside Docker" : "")." : nil,
                      kept > 0 ? "\(bytes(kept)) is protected." : nil]
-        if let at = status.totalsAt { parts.append("Measured \(ago(at)).") }
-        if status.dryRun { parts.append("Dry run: deleting only records what would go.") }
+        if let at = status.totalsAt { parts.append("Folders measured \(ago(at)).") }
         return parts.compactMap { $0 }.joined(separator: " ")
     }
 }
@@ -247,12 +258,14 @@ struct ItemRow: View {
         HStack(spacing: 8) {
             if let tick {
                 Toggle("", isOn: tick).toggleStyle(.checkbox).labelsHidden()
+            } else if item.canFree && item.date == nil { // being freed right now
+                ProgressView().controlSize(.small).frame(width: 16).accessibilityHidden(true)
             } else if !item.canFree && item.date == nil {
                 Image(systemName: "lock").foregroundStyle(.secondary).frame(width: 16).help("Protected: can't be ticked")
             }
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 6) {
-                    Text(inCard ? item.inProject : item.name).font(.body.monospaced())
+                    Text(inCard ? item.inProject : item.name).font(item.kind == "simulator" ? .body : .body.monospaced()) // mono only for real folder names
                         .foregroundStyle(item.dryRun ? .secondary : .primary) // a dry-run row: nothing was deleted
                     if !inCard {
                         Text(item.place).foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
@@ -353,10 +366,10 @@ struct ConfirmSheet: View {
             Text("\(dryRun ? "Record" : "Delete") \(rows.count) \(rows.count == 1 ? "folder" : "folders"), \(bytes(total))?")
                 .font(.title2.weight(.semibold))
             Text(dryRun ? "It's the dry run week, so nothing is deleted. History lists these as what Headroom would delete."
-                 : "Headroom checks each folder again just before deleting it. Each one is listed in History, where one click brings it back: Rebuild runs its install or build again, and Download Again fetches a model. \(rebuildTime).")
+                 : "Headroom checks each folder again just before deleting it. Each one is listed in History, where Rebuild runs its install or build again\(rows.contains { $0.info.section == .models } ? " and Download Again fetches a model" : ""). \(rebuildTime).")
                 .fixedSize(horizontal: false, vertical: true)
             VStack(spacing: 6) { // every row it acts on, or the largest seven and what's left, never a silent cut
-                let shown = rows.count > 8 ? Array(rows.prefix(7)) : rows
+                let shown = Array(rows.prefix(rows.count > 8 ? 7 : 8))
                 ForEach(shown) { r in
                     HStack {
                         Text(r.project.map { "\(($0 as NSString).lastPathComponent) › \(r.inProject)" } ?? r.name).font(.body.monospaced()).lineLimit(1)

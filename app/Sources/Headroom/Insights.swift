@@ -381,7 +381,7 @@ struct FreeSpaceChart: View, AXChartDescriptorRepresentable {
                 ForEach(jumps.filter { !near($0.at, end?.at) }, id: \.at) { j in
                     PointMark(x: .value("Time", j.at), y: .value("Free", grow ? gb(insights.free(at: j.at) ?? 0) : 0))
                         .symbol(.circle).symbolSize(30).foregroundStyle(Color.primary)
-                        .annotation(position: .top, alignment: .trailing) { Text("You freed \(bytes(j.bytes))").font(.caption) }
+                        .annotation(position: .top, alignment: .trailing) { Text("\(bytes(j.bytes)) freed outside Headroom").font(.caption) }
                 }
                 ForEach(gaps, id: \.self) { t in
                     RuleMark(x: .value("Time", t)).foregroundStyle(Color.secondary.opacity(0.4))
@@ -389,7 +389,7 @@ struct FreeSpaceChart: View, AXChartDescriptorRepresentable {
                         .annotation(position: .top) { Text("Mac asleep").font(.caption).foregroundStyle(.secondary) }
                 }
                 if let end {
-                    let jump = jumps.first { near($0.at, end.at) }.map { "You freed \(bytes($0.bytes)) · " } ?? ""
+                    let jump = jumps.first { near($0.at, end.at) }.map { "\(bytes($0.bytes)) freed outside Headroom · " } ?? ""
                     PointMark(x: .value("Time", end.at), y: .value("Free", grow ? gb(end.free) : 0))
                         .symbolSize(30).foregroundStyle(Color.primary)
                         .annotation(position: .top, alignment: .trailing) { Text("\(jump)Now \(bytes(end.free))").font(.caption).monospacedDigit() }

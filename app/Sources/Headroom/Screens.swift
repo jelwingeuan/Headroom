@@ -21,15 +21,15 @@ enum Screens {
     }
 
     static let done = [
-        row("1", "/Users/me/code/shop/node_modules", "node_modules", 1.2, daysAgo: 0.0006, used: 40, rebuild: "npm ci"),
+        row("1", "/Users/me/code/shop/node_modules", "node_modules", 1.2, daysAgo: 1 / 86_400, used: 40, rebuild: "npm ci"),
         row("2", "/Users/me/code/engine/target", "target", 4.8, daysAgo: 1, used: 33, rebuild: "cargo build"),
         row("3", "/Users/me/Library/Developer/Xcode/DerivedData/Atlas-bxjqk", "DerivedData", 2.1, daysAgo: 3, used: 38,
             undone: true, rebuild: "xcodebuild").merging(["rebuild_secs": 184]) { $1 },
         row("4", "/Users/me/code/ml/.venv", ".venv", 0.9, daysAgo: 6, used: 51, rebuild: "pip install -r requirements.txt"),
     ]
     static let wouldHave = [
-        row("d1", "/Users/me/code/blog/node_modules", "node_modules", 0.6, daysAgo: 0.0006, used: 92, dryRun: true),
-        row("d2", "/Users/me/code/game/target", "target", 6.3, daysAgo: 0.0006, used: 41, dryRun: true),
+        row("d1", "/Users/me/code/blog/node_modules", "node_modules", 0.6, daysAgo: 1 / 86_400, used: 92, dryRun: true),
+        row("d2", "/Users/me/code/game/target", "target", 6.3, daysAgo: 1 / 86_400, used: 41, dryRun: true),
         row("d3", "/Users/me/.ollama/models/manifests/registry.ollama.ai/library/llama3.2", "ollama_model", 2.0, daysAgo: 2, used: 63, dryRun: true),
     ]
     /// The same dry-run rows from the trial week, which ended before the plenty world's deletes.
@@ -213,7 +213,9 @@ enum Screens {
                 let overview = AppModel(fixture: fixture, pane: .overview)
                 shoot(OverviewView().environmentObject(overview), size: CGSize(width: 760, height: 1900), appearance,
                       dir.appendingPathComponent("overview-full-\(world)-\(look).png"))
-                let picks = Overview(overview.breakdown).freeable.filter { $0.info.unticked == nil }
+                let s = overview.status, acting = !s.dryRun && (s.freeBytes ?? 0) < (s.budgetBytes ?? 0)
+                let list = Overview(overview.breakdown, freeing: acting ? s.next?.path : nil) // what the button's selection really holds
+                let picks = list.freeable.filter { list.defaults.contains($0.path) }
                 if !picks.isEmpty {
                     shoot(ConfirmSheet(rows: picks, dryRun: overview.status.dryRun, history: overview.actions) {}
                         .background(Color(nsColor: .windowBackgroundColor)), size: nil, appearance, dir.appendingPathComponent("sheet-\(world)-\(look).png"))
@@ -283,7 +285,7 @@ enum Screens {
         let busy: JSON = ["event": "skip", "path": "/Users/me/code/shop/node_modules", "kind": "node_modules",
                           "reason": "in use: node is working in /Users/me/code/shop"]
         expect(line([busy]) == "Waiting: shop is in use", "live line: \(line([busy]))")
-        expect(line([["event": "tick"]]) == "Checked, nothing needed", "live line: \(line([["event": "tick"]]))")
+        expect(line([["event": "tick"]]) == "Free space checked, nothing needed", "live line: \(line([["event": "tick"]]))")
         return failures
     }
 

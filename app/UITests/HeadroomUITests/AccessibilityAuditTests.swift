@@ -33,13 +33,13 @@ final class AccessibilityAuditTests: XCTestCase {
             let menu = launch(world, open: "menu")
             audit(menu, "menu \(world)")
             menu.terminate()
-            guard world == "plenty" || world == "first-run" else { continue }
+            guard world != "error" else { continue }
             let app = launch(world, open: "main")
-            audit(app, "window insights \(world)")
-            app.outlines.staticTexts["History"].firstMatch.click()
-            audit(app, "window history \(world)")
-            app.outlines.staticTexts["Dry Run"].firstMatch.click()
-            audit(app, "window dry-run \(world)")
+            audit(app, "window overview \(world)")
+            for pane in ["Insights", "History", "Settings", "About"] {
+                app.outlines.staticTexts[pane].firstMatch.click()
+                audit(app, "window \(pane.lowercased()) \(world)")
+            }
             app.terminate()
             let settings = launch(world, open: "settings")
             sleep(1)
