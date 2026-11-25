@@ -3,6 +3,7 @@
 use crate::json::Json;
 use crate::state::{self, Ctx, Settings, DAY};
 use crate::{autopilot, obj, rebuild, sys};
+use std::path::PathBuf;
 
 fn error(msg: impl Into<String>) -> Json {
     obj! {"error" => msg.into()}
@@ -24,7 +25,35 @@ pub fn call(request: &str) -> Json {
         "digest" => digest(&ctx),
         "samples" => samples(&ctx),
         "breakdown" => breakdown(&ctx),
+        "rescan" => rescan(&ctx),
+        "reclaim" => reclaim(&ctx, &req),
         op => error(format!("unknown op {op:?}")),
+    }
+}
+
+/// Scans now and saves the totals and breakdown a tick would; replies with that breakdown.
+fn rescan(ctx: &Ctx) -> Json {
+    autopilot::rescan(ctx).unwrap_or_else(error)
+}
+
+/// Reclaims the folders the user picked, each once and only if a fresh scan says it may go.
+fn reclaim(ctx: &Ctx, req: &Json) -> Json {
+    let bad = || error("reclaim needs paths: a non-empty array of folder paths");
+    let Some(Json::Arr(list)) = req.get("paths") else { return bad() };
+    let mut paths: Vec<PathBuf> = vec![];
+    for p in list {
+        let Some(p) = p.str().map(PathBuf::from) else { return bad() };
+        if !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
+    if paths.is_empty() {
+        return bad();
+    }
+    let mut events = vec![];
+    match autopilot::reclaim_picked(ctx, &paths, &mut |e| events.push(e)) {
+        Ok(b) => obj! {"events" => events, "breakdown" => b},
+        Err(e) => error(e),
     }
 }
 
@@ -172,6 +201,9 @@ fn digest(ctx: &Ctx) -> Json {
     let would: u64 = state::read_lines(&ctx.file("dryrun.jsonl"))
         .iter()
         .filter(|d| recent(d))
+        // A Docker pick in the dry run would free nothing on this disk; rows from before the
+        // field existed are all host rows.
+        .filter(|d| d.get("frees_host").and_then(Json::bool).unwrap_or(true))
         .filter_map(|d| d.get("bytes")?.u64())
         .sum();
     let st = state::load_state(ctx);
@@ -320,7 +352,9 @@ mod tests {
             for k in ["entries", "kinds", "totals_at"] {
                 assert_eq!(b.get(k), Some(&Json::Null), "{k} before any tick");
             }
-            crate::autopilot::tick(&c, budget, &mut |_| {});
+            let mut ev = vec![];
+            crate::autopilot::tick(&c, budget, &mut |e| ev.push(e));
+            assert!(ev.iter().all(|e| !e.s("kind").starts_with("docker_")), "autopilot leaves Docker alone: {ev:?}");
             let before = scans();
             let (s, b, rows) = (status(&c), breakdown(&c), samples(&c));
             assert_eq!(scans(), before, "status, breakdown and samples never scan");
@@ -328,9 +362,10 @@ mod tests {
             assert_eq!((n(row, "at"), n(row, "budget")), (c.now, budget));
             assert!(n(row, "free") > 0);
 
-            // The per-kind totals are exactly the status totals.
+            // The per-kind totals are exactly the status totals, and leave Docker out.
             assert_eq!(b.get("totals_at"), s.get("totals_at"));
             let Some(Json::Obj(kinds)) = b.get("kinds") else { panic!("{b}") };
+            assert!(kinds.iter().all(|(k, _)| !k.starts_with("docker_")), "{b}");
             let sum = |k: &str| kinds.iter().map(|(_, t)| n(t, k)).sum::<u64>();
             assert_eq!(sum("free_bytes"), n(&s, "reclaimable_bytes"), "{b}");
             assert_eq!(sum("protected_bytes"), n(&s, "protected_bytes"), "{b}");
@@ -342,20 +377,27 @@ mod tests {
                 crate::scan::scan(&c, &c.home).unwrap().cands.iter().map(crate::scan::Cand::to_json).collect();
             assert!(listed.iter().any(|e| e.s("kind") == "docker_build_cache"), "the fake docker was seen");
             for e in &listed {
-                let found = entries.iter().find(|x| x.s("path") == e.s("path"));
-                if e.s("kind").starts_with("docker_") {
-                    assert!(found.is_none(), "Docker frees nothing on this volume: {e}");
-                } else if e.get("reclaimable") == Some(&Json::Bool(true)) {
-                    let f = found.unwrap_or_else(|| panic!("{e} missing from {b}"));
+                let f = entries
+                    .iter()
+                    .find(|x| x.s("path") == e.s("path"))
+                    .unwrap_or_else(|| panic!("{e} missing from {b}"));
+                assert_eq!(f.get("project"), e.get("project"), "{f}");
+                // Docker may go, but frees nothing on this volume.
+                assert_eq!(f.get("frees_host"), Some(&Json::Bool(!e.s("kind").starts_with("docker_"))), "{f}");
+                if e.get("reclaimable") == Some(&Json::Bool(true)) {
                     assert_eq!(f.get("free"), Some(&Json::Bool(true)), "{f}");
                     assert_eq!((f.get("bytes"), f.s("reason")), (e.get("bytes"), e.s("reason")), "{f}");
                 } else {
                     // Kept: by path only, since `scan` leaves kept folders unsized (a speed choice).
-                    let f = found.unwrap_or_else(|| panic!("{e} missing from {b}"));
                     assert_eq!(f.get("free"), Some(&Json::Bool(false)), "{f}");
                 }
             }
-            assert_eq!(entries.len(), listed.len() - 1, "nothing listed that scan doesn't list");
+            assert_eq!(entries.len(), listed.len(), "nothing listed that scan doesn't list");
+            for name in ["cold", "recent"] {
+                let p = c.home.join("code").join(name);
+                let e = entries.iter().find(|x| x.s("path") == p.join("node_modules").to_string_lossy()).unwrap();
+                assert_eq!(e.s("project"), p.to_string_lossy(), "{e}");
+            }
         }
     }
 
@@ -399,5 +441,208 @@ mod tests {
         assert!(undo(&ctx, &obj! {"id" => "nope"}).get("error").is_some());
         let d = digest(&ctx);
         assert!(!d.s("body").is_empty());
+    }
+
+    /// A committed Node project whose 1 MB node_modules was last touched at `when`.
+    fn project(ctx: &Ctx, name: &str, when: u64) -> std::path::PathBuf {
+        use crate::testutil::{git, touch, write};
+        let p = ctx.home.join("code").join(name);
+        write(&p.join("package.json"), "{}");
+        write(&p.join("package-lock.json"), "{}");
+        write(&p.join(".gitignore"), "node_modules/\n");
+        git(&p, &["init", "-q"], Some(when));
+        git(&p, &["add", "-A"], Some(when));
+        git(&p, &["commit", "-qm", "c"], Some(when));
+        std::fs::create_dir_all(p.join("node_modules/x")).unwrap();
+        std::fs::write(p.join("node_modules/x/blob.js"), vec![1u8; 1 << 20]).unwrap();
+        write(&p.join("node_modules/.package-lock.json"), "{}");
+        touch(&p.join("node_modules/x/blob.js"), when);
+        p
+    }
+
+    fn listed(b: &Json) -> Vec<String> {
+        b.get("entries").unwrap().arr().iter().map(|e| e.s("path").to_string()).collect()
+    }
+
+    #[test]
+    fn rescan_saves_a_fresh_breakdown_and_totals_now() {
+        let mut ctx = crate::testutil::ctx("api-rescan");
+        let a = project(&ctx, "a", 1_600_000_000).join("node_modules");
+        let a_str = a.to_string_lossy().into_owned();
+        let scans = || crate::scan::SCANS.with(|n| n.get());
+        let before = scans();
+        let b = rescan(&ctx);
+        assert_eq!(scans(), before + 1, "one scan");
+        assert_eq!(breakdown(&ctx), b, "saved as returned");
+        assert!(listed(&b).contains(&a_str), "{b}");
+        let s = status(&ctx);
+        assert_eq!(s.get("totals_at").and_then(Json::u64), Some(ctx.now));
+        assert!(s.get("reclaimable_bytes").and_then(Json::u64).unwrap() >= 1 << 20, "{s}");
+        assert_eq!(s.get("last_tick"), Some(&Json::Null), "a rescan is not a tick");
+        assert!(a.join("x/blob.js").exists(), "nothing deleted");
+
+        // The disk changed since: the next rescan shows it without waiting a day.
+        let new = project(&ctx, "b", 1_600_000_000).join("node_modules");
+        std::fs::remove_dir_all(&a).unwrap();
+        ctx.now += 60;
+        let b = rescan(&ctx);
+        assert_eq!(breakdown(&ctx), b);
+        assert_eq!(b.get("totals_at").and_then(Json::u64), Some(ctx.now));
+        assert!(!listed(&b).contains(&a_str), "{b}");
+        assert!(listed(&b).contains(&new.to_string_lossy().into_owned()), "{b}");
+
+        let mut gone = ctx.clone();
+        gone.home = ctx.home.join("missing");
+        assert!(rescan(&gone).get("error").is_some());
+    }
+
+    /// Past the automatic first-week dry run: reclaims delete for real.
+    fn live(name: &str) -> Ctx {
+        let mut ctx = crate::testutil::ctx(name);
+        state::created(&ctx);
+        ctx.now += 8 * DAY;
+        assert!(!state::dry_run(&ctx).0);
+        ctx
+    }
+
+    fn pick(ctx: &Ctx, paths: &[&std::path::Path]) -> Json {
+        let paths: Vec<Json> = paths.iter().map(|p| Json::from(*p)).collect();
+        reclaim(ctx, &obj! {"op" => "reclaim", "paths" => paths})
+    }
+
+    fn events(r: &Json) -> &[Json] {
+        r.get("events").unwrap_or_else(|| panic!("{r}")).arr()
+    }
+
+    #[test]
+    fn reclaim_refuses_bad_input_and_folders_the_scan_keeps() {
+        use crate::testutil::{git, write};
+        let ctx = live("api-reclaim-refuse");
+        let scans = || crate::scan::SCANS.with(|n| n.get());
+        let before = scans();
+        for req in [
+            obj! {"op" => "reclaim"},
+            obj! {"op" => "reclaim", "paths" => Vec::<Json>::new()},
+            obj! {"op" => "reclaim", "paths" => "/x/node_modules"},
+            obj! {"op" => "reclaim", "paths" => vec![Json::from("/x/node_modules"), Json::from(1)]},
+        ] {
+            assert!(reclaim(&ctx, &req).get("error").is_some(), "{req}");
+        }
+        assert_eq!(scans(), before, "bad input is refused before scanning");
+
+        let recent = project(&ctx, "recent", ctx.now - DAY).join("node_modules");
+        let tracked = ctx.home.join("code/tracked");
+        write(&tracked.join("package.json"), "{}");
+        write(&tracked.join("package-lock.json"), "{}");
+        write(&tracked.join("node_modules/.package-lock.json"), "{}");
+        write(&tracked.join("node_modules/x/index.js"), "module.exports = 1\n");
+        git(&tracked, &["init", "-q"], Some(1_600_000_000));
+        git(&tracked, &["add", "-A"], Some(1_600_000_000));
+        git(&tracked, &["commit", "-qm", "c"], Some(1_600_000_000));
+        let tracked = tracked.join("node_modules");
+        let unknown = ctx.home.join("code/recent"); // a project, not a candidate
+        let r = pick(&ctx, &[&unknown, &recent, &tracked, std::path::Path::new("/nowhere/node_modules")]);
+        assert_eq!(scans(), before + 1, "one scan");
+        let ev = events(&r);
+        assert_eq!(ev.len(), 4, "{r}");
+        assert!(ev.iter().all(|e| e.s("event") == "skip"), "{r}");
+        assert_eq!((ev[0].s("path"), ev[0].s("reason")), (&*unknown.to_string_lossy(), "not found in the latest scan"));
+        assert_eq!(ev[0].get("kind"), None, "{r}");
+        assert!(ev[1].s("reason").starts_with("used 1 days ago"), "{r}");
+        assert_eq!((ev[1].s("kind"), ev[1].s("path")), ("node_modules", &*recent.to_string_lossy()));
+        assert_eq!(ev[2].s("reason"), "git tracks files inside it", "{r}");
+        assert_eq!(ev[3].s("reason"), "not found in the latest scan", "{r}");
+        assert!(recent.join("x/blob.js").exists() && tracked.join("x/index.js").exists());
+        assert!(state::history(&ctx).is_empty() && state::read_lines(&ctx.file("dryrun.jsonl")).is_empty());
+        assert_eq!(r.get("breakdown"), Some(&breakdown(&ctx)), "the scan's list is saved too");
+        assert!(listed(&breakdown(&ctx)).contains(&recent.to_string_lossy().into_owned()));
+    }
+
+    #[test]
+    fn reclaim_in_the_dry_run_deletes_nothing_and_logs_what_it_would_do() {
+        let ctx = crate::testutil::ctx("api-reclaim-dry");
+        assert!(state::dry_run(&ctx).0, "the first week");
+        let a = project(&ctx, "a", 1_600_000_000).join("node_modules");
+        let recent = project(&ctx, "recent", ctx.now - DAY).join("node_modules");
+        let r = pick(&ctx, &[&a, &recent]);
+        let ev = events(&r);
+        assert_eq!(ev.len(), 2, "{r}");
+        assert_eq!(
+            (ev[0].s("event"), ev[0].s("path"), ev[0].s("kind")),
+            ("would_reclaim", &*a.to_string_lossy(), "node_modules")
+        );
+        // What the scan keeps isn't even pretended.
+        assert_eq!((ev[1].s("event"), ev[1].s("path")), ("skip", &*recent.to_string_lossy()), "{r}");
+        assert!(ev[0].get("bytes").and_then(Json::u64).unwrap() >= 1 << 20, "{r}");
+        assert!(a.join("x/blob.js").exists(), "nothing deleted");
+        assert!(state::history(&ctx).is_empty());
+        let dry = state::read_lines(&ctx.file("dryrun.jsonl"));
+        assert_eq!(dry.len(), 1);
+        assert_eq!((dry[0].s("path"), dry[0].get("dry_run")), (&*a.to_string_lossy(), Some(&Json::Bool(true))));
+        assert_eq!(dry[0].get("bytes"), ev[0].get("bytes"));
+        let b = r.get("breakdown").unwrap();
+        assert_eq!(b, &breakdown(&ctx));
+        let e =
+            b.get("entries").unwrap().arr().iter().find(|e| e.s("path") == a.to_string_lossy()).expect("still listed");
+        assert_eq!(e.get("free"), Some(&Json::Bool(true)), "{e}");
+    }
+
+    #[test]
+    fn reclaim_deletes_picked_folders_as_manual_and_drops_them_from_the_list() {
+        use crate::testutil::{script, world};
+        let mut ctx = live("api-reclaim-live");
+        ctx.machine = true; // Docker is a machine-wide place
+        let log = world(&ctx).join("docker.log");
+        script(
+            &world(&ctx).join("docker"),
+            &format!(
+                r#"echo "$@" >> '{}'
+case "$1 $2" in "system df") echo '{{"Type":"Build Cache","Reclaimable":"1.5GB"}}';; esac"#,
+                log.display()
+            ),
+        );
+        ctx.path_var = format!("{}:/usr/bin:/bin", world(&ctx).display());
+        let a = project(&ctx, "a", 1_600_000_000).join("node_modules");
+        let b = project(&ctx, "b", 1_600_000_000).join("node_modules");
+        let docker = std::path::Path::new("docker://build-cache");
+        let before = rescan(&ctx);
+        assert!(listed(&before).contains(&a.to_string_lossy().into_owned()), "{before}");
+        assert!(listed(&before).contains(&docker.to_string_lossy().into_owned()), "{before}");
+        let free_before = status(&ctx).get("reclaimable_bytes").and_then(Json::u64).unwrap();
+
+        // Asked twice: reclaimed once.
+        let r = pick(&ctx, &[&a, docker, &a]);
+        let ev = events(&r);
+        let got: Vec<(&str, &str)> = ev.iter().map(|e| (e.s("event"), e.s("path"))).collect();
+        assert_eq!(got, [("reclaim", &*a.to_string_lossy()), ("reclaim", "docker://build-cache")], "{r}");
+        assert!(ev.iter().all(|e| !e.s("id").is_empty() && e.get("bytes").and_then(Json::u64).unwrap() > 0), "{r}");
+        assert!(!a.exists() && b.join("x/blob.js").exists());
+        assert!(std::fs::read_to_string(&log).unwrap().contains("builder prune -f\n"));
+        let h = state::history(&ctx);
+        assert_eq!(h.len(), 2);
+        assert!(h.iter().all(|x| x.s("origin") == "manual"), "{h:?}");
+        assert_eq!(h[1].get("frees_host"), Some(&Json::Bool(false)), "Docker frees nothing on this disk");
+        assert_eq!(history(&ctx).get("actions").unwrap().arr()[0].s("origin"), "manual");
+
+        // The saved list and totals no longer have them; the rest stays.
+        let after = r.get("breakdown").unwrap();
+        assert_eq!(after, &breakdown(&ctx));
+        let paths = listed(after);
+        assert!(!paths.contains(&a.to_string_lossy().into_owned()) && !paths.contains(&"docker://build-cache".into()));
+        assert!(paths.contains(&b.to_string_lossy().into_owned()), "{after}");
+        let free_after = status(&ctx).get("reclaimable_bytes").and_then(Json::u64).unwrap();
+        assert!(free_after + (1 << 20) <= free_before, "{free_before} -> {free_after}");
+    }
+
+    #[test]
+    fn digest_would_bytes_leave_out_docker_dry_run_picks() {
+        let ctx = crate::testutil::ctx("api-digest-docker");
+        state::log_dry_run(
+            &ctx,
+            obj! {"at" => ctx.now, "path" => "/x/node_modules", "kind" => "node_modules", "bytes" => 5u64, "dry_run" => true},
+        );
+        let docker = obj! {"at" => ctx.now, "path" => "docker://build-cache", "kind" => "docker_build_cache", "bytes" => 7u64, "dry_run" => true, "frees_host" => false};
+        state::log_dry_run(&ctx, docker);
+        assert_eq!(digest(&ctx).get("would_bytes").and_then(Json::u64), Some(5));
     }
 }

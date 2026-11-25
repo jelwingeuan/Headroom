@@ -15,8 +15,8 @@ void    headroom_free(char *reply);                           // frees a reply f
 - `headroom_main` takes the process's arguments with `argv[0]`. It is the whole command line in
   `judge/CONTRACT.md` plus `mcp`, `archive` and `restore` (run `headroom help`).
 - `headroom_call` never returns NULL and never unwinds across the boundary. Calls are
-  serialized inside the core, so any thread may call it; each call blocks until done (`tick`
-  and `undo` can take minutes: call them off the main thread).
+  serialized inside the core, so any thread may call it; each call blocks until done (`tick`,
+  `undo`, `rescan` and `reclaim` can take minutes: call them off the main thread).
 - Every reply is a JSON object. A failed request has an `"error"` string and nothing else is
   promised. Unknown fields should be ignored; missing ones treated as unknown.
 - State lives in `$HEADROOM_HOME` (default `~/Library/Application Support/Headroom`).
@@ -46,8 +46,8 @@ Cheap: one `statvfs` and a few small files, no scan. Call it as often as needed.
   as free space until it expires.
 - `permission_errors`: folders the last scan couldn't read (Full Disk Access is missing).
 - `reclaimable_bytes`: what autopilot could still reclaim under the saved settings (eligible,
-  cold, not busy), after that tick's own deletes, in private bytes. Docker is left out (its
-  space stays inside its VM disk).
+  cold, not busy), after that tick's (or `reclaim`'s) own deletes, in private bytes. Docker is
+  left out (its space stays inside its VM disk).
 - `protected_bytes`: what the same scan found and kept (recent, in use, conversation history,
   tracked, the newest simulator…), in private bytes, nothing counted twice. Kept folders are
   only sized during ticks, never by `scan`, so this costs nothing at status time.
@@ -55,7 +55,8 @@ Cheap: one `statvfs` and a few small files, no scan. Call it as often as needed.
 - `totals_at`: when that scan ran. All four are `null` until a tick has scanned. A tick
   under budget pressure always scans (dry run included); any other tick, with plenty of space
   or no budget chosen, makes one read-only scan when the saved totals are missing or 24 hours
-  old, and deletes nothing. So the totals are at most a day old while ticks run.
+  old, and deletes nothing. So the totals are at most a day old while ticks run. `rescan` and
+  `reclaim` refresh them too.
 - `breakdown` lists the folders behind these totals.
 
 ### `history`
@@ -67,7 +68,7 @@ Cheap: one `statvfs` and a few small files, no scan. Call it as often as needed.
 ```
 Newest first, at most 500. `dry_run: true` rows are what the dry run would have reclaimed
 (the "Would Have Done" list); they can't be undone because nothing was deleted. `origin` is
-`clean`, `autopilot`, `mcp` or `archive`. `frees_host` (false for Docker), `undone_at` and `rebuild_secs` (seconds the rebuild took) come from the history file. `data_loss` (when present) says what undo can't
+`clean`, `autopilot`, `mcp`, `archive` or `manual` (the `reclaim` op). `frees_host` (false for Docker), `undone_at` and `rebuild_secs` (seconds the rebuild took) come from the history file. `data_loss` (when present) says what undo can't
 bring back: a simulator's apps and test data. `partial: true` marks a delete that failed
 midway; undo rebuilds over what was left.
 
@@ -117,32 +118,60 @@ Free space over time, for the Insights chart. Cheap: reads `samples.jsonl`, no s
 - `[]` before the first tick.
 
 ### `breakdown`
-What the tick behind `status`'s totals measured, folder by folder. Cheap: reads
-`last-scan.json`, no scan.
+What the scan behind `status`'s totals measured (a tick's, `rescan`'s or `reclaim`'s), folder
+by folder. Cheap: reads `last-scan.json`, no scan.
 ```json
 {"entries": [{"path": "/Users/me/code/old/node_modules", "kind": "node_modules", "bytes": 412000000,
-              "free": true, "reason": "Node project (package.json); git ignores it; last used 92 days ago; rebuild: npm ci"},
+              "free": true, "frees_host": true, "project": "/Users/me/code/old",
+              "reason": "Node project (package.json); git ignores it; last used 92 days ago; rebuild: npm ci"},
+             {"path": "docker://build-cache", "kind": "docker_build_cache", "bytes": 1500000000,
+              "free": true, "frees_host": false, "project": null, "reason": "Docker build cache"},
              {"path": "/Users/me/code/app/node_modules", "kind": "node_modules", "bytes": 380000000,
-              "free": false, "reason": "used 2 days ago (recent: the last 14 days)"}],
+              "free": false, "frees_host": true, "project": "/Users/me/code/app",
+              "reason": "used 2 days ago (recent: the last 14 days)"}],
  "kinds": {"node_modules": {"free_bytes": 30000000000, "protected_bytes": 15000000000},
            "ai_history": {"free_bytes": 0, "protected_bytes": 3000000000}},
  "totals_at": 1763251200}
 ```
-- `free: true`: autopilot could still reclaim it (counted in `reclaimable_bytes`).
+- `free: true`: it may go (counted in `reclaimable_bytes` when `frees_host`).
   `free: false`: kept, and `reason` says why (counted in `protected_bytes`). `reason` is the
   text `scan --json` gives.
+- `frees_host: false`: Docker, whose space stays inside its VM disk. It is listed when it may
+  go (so it can be picked for `reclaim`) but counted in no kind and no total, and autopilot
+  never reclaims it. Every other entry has `frees_host: true`.
+- `project`: the project `scan --json` gives (git top level, else the folder with the project
+  file), or `null` (machine-wide places).
 - The same numbers as `status`: summed over every kind, `free_bytes` is `reclaimable_bytes`
-  and `protected_bytes` is `protected_bytes`, and `totals_at` is the same tick's. Each folder
-  is counted once: a kept folder holding folders that may go counts only the rest, a kept
-  folder inside another candidate is counted in that one and not listed, and Docker is left
-  out (its space stays inside its VM disk).
+  and `protected_bytes` is `protected_bytes`, and `totals_at` is the same scan's. Each folder
+  is counted once: a kept folder holding folders that may go counts only the rest, and a kept
+  folder inside another candidate is counted in that one and not listed.
 - `entries` holds the 2,000 largest, largest first; `kinds` covers everything. A kind's bytes
   not in `entries` are its totals minus its listed entries.
-- Against `scan <home> --json` on an unchanged disk: every entry it marks reclaimable, Docker's
-  aside, is here with the same `bytes` and `reason`. Kept entries (other than those inside
+- Against `scan <home> --json` on an unchanged disk: every entry it marks reclaimable is here
+  with the same `bytes`, `reason` and `project`. Kept entries (other than those inside
   another candidate) are here too, but match by path only: for speed `scan` doesn't size kept
   folders (most show 0 bytes there), while the tick sizes them for these totals.
-- All three are `null` until a tick has scanned.
+- All three are `null` until a tick, `rescan` or `reclaim` has scanned.
+
+### `rescan`
+`{"op": "rescan"}` scans home now, as a tick refreshing its totals does (nothing is deleted),
+saves `status`'s totals and `last-scan.json` the same way, and replies with the new
+`breakdown` object. It is not a tick: `last_tick`, `next` and the samples don't change.
+
+### `reclaim`
+`{"op": "reclaim", "paths": ["/Users/me/code/old/node_modules", "docker://build-cache"]}`
+reclaims folders picked from `breakdown`.
+- `paths` must be a non-empty array of strings, else `{"error": "…"}`. A path given twice is
+  handled once.
+- One scan of home. A path goes only if that scan found a candidate with exactly that path and
+  says it may go (`free: true`; Docker too, since the user picked it). Each is rechecked from
+  scratch right before its delete, as autopilot's are, and recorded in history with `origin`
+  `manual`.
+- In the dry run nothing is deleted: each is added to the dry-run log, as a tick does.
+- Reply `{"events": […], "breakdown": {…}}`. One event per path, in order: `reclaim` or
+  `would_reclaim` (as in the table below), or `skip` with `path` and `reason`: `"not found in
+  the latest scan"` (no `kind`), the scan's reason for keeping it, or why the recheck refused
+  it. `breakdown` is the new one, saved as `rescan` saves it, without what was reclaimed.
 
 ## Autopilot events (`tick` op and `headroom autopilot --once`, one JSON object per line)
 
@@ -196,8 +225,9 @@ what statfs saw come free and is included in `freed_bytes`.
   hourly; rewritten atomically (temporary file and rename) at most once a day to drop rows
   older than 400 days. Lines that don't parse are skipped.
 - `HEADROOM_HOME/last-scan.json`, one object: exactly what `breakdown` returns. Rewritten
-  atomically by every tick that scans (any tick under pressure, else at most daily), under
-  the same lock as the state file holding `status`'s totals, so both come from the same tick.
+  atomically by every tick that scans (any tick under pressure, else at most daily) and by
+  `rescan` and `reclaim`, under the same lock as the state file holding `status`'s totals, so
+  both come from the same scan.
 
 ## Known limits
 
