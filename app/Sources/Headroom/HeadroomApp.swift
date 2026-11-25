@@ -63,7 +63,6 @@ struct MenuBarIcon: View {
             .accessibilityValue(label(mood))
     }
 
-
     private func label(_ m: Mood) -> String {
         switch m {
         case .unknown: "measuring free space"
@@ -132,11 +131,13 @@ struct SpaceBar: View {
                 ZStack(alignment: .topLeading) {
                     Text("\(bytes(capacity)) disk").foregroundStyle(.secondary).monospacedDigit()
                         .frame(maxWidth: .infinity, alignment: .trailing)
-                        .opacity(budget > 0 && at > geo.size.width - 150 ? 0 : 1)
-                    if budget > 0 {
-                        Label("\(bytes(budget)) budget", systemImage: "line.diagonal").labelStyle(BudgetLabelStyle())
+                        .opacity(budget > 0 && at > geo.size.width - 210 ? 0 : 1)
+                    if budget > 0 { // the label's tick sits exactly under the marker, flipped near the right end
+                        let flip = at > 130 // always left of the marker when it fits, the same in the menu and the window
+                        Label("\(bytes(budget)) budget", systemImage: "line.diagonal").labelStyle(BudgetLabelStyle(tickTrailing: flip))
                             .fixedSize()
-                            .position(x: min(max(at, 50), geo.size.width - 50), y: 8)
+                            .frame(maxWidth: .infinity, alignment: flip ? .trailing : .leading)
+                            .offset(x: flip ? at - geo.size.width + 1 : at - 1)
                     }
                 }
             }
@@ -164,7 +165,7 @@ struct HatchedBar: View {
                 var p = Path()
                 p.move(to: CGPoint(x: x, y: size.height))
                 p.addLine(to: CGPoint(x: x + size.height, y: 0))
-                ctx.stroke(p, with: .color(Color.primary.opacity(0.55)), lineWidth: 1.5)
+                ctx.stroke(p, with: .color(Color.primary.opacity(0.8)), lineWidth: 1.5)
                 x += 4
             }
         }
@@ -194,10 +195,12 @@ struct Swatch: View {
 
 /// "| 60 GB budget": a short vertical tick like the one on the chart, then the label.
 struct BudgetLabelStyle: LabelStyle {
+    var tickTrailing = false
     func makeBody(configuration: Configuration) -> some View {
         HStack(spacing: 4) {
-            Rectangle().fill(.primary).frame(width: 2, height: 10)
+            if !tickTrailing { Rectangle().fill(.primary).frame(width: 2, height: 10) }
             configuration.title.foregroundStyle(.secondary).monospacedDigit()
+            if tickTrailing { Rectangle().fill(.primary).frame(width: 2, height: 10) }
         }
     }
 }
@@ -234,10 +237,6 @@ struct MenuView: View {
                 LiveLine(checking: model.ticking > 0, last: model.lastCheck)
             }
 
-            if s.dryRun && !planned.isEmpty && mood != .noBudget {
-                WouldDoList(rows: Array(planned.prefix(3)), total: planned.count) { open(.wouldHaveDone) }
-            }
-
             if s.snapshotHolding {
                 Notice(symbol: "clock.badge.exclamationmark",
                        text: "A Time Machine snapshot holds some freed space for up to a day.")
@@ -251,7 +250,7 @@ struct MenuView: View {
             Divider()
             // Real controls, not imitation menu items: a window-style extra gets a footer bar.
             HStack(spacing: 8) {
-                Button("Open Headroom") { open(.insights) }.keyboardShortcut("o")
+                Button("Open Headroom") { open(.overview) }.keyboardShortcut("o")
                 Spacer()
                 // A plain button that opens a real NSMenu: VoiceOver gets a press action, people a menu.
                 Button { showMoreMenu(mood) } label: { Image(systemName: "ellipsis.circle") }
@@ -268,13 +267,8 @@ struct MenuView: View {
             Button("") { openSettings() }.keyboardShortcut(",").opacity(0).accessibilityHidden(true)
             Button("") { NSApp.terminate(nil) }.keyboardShortcut("q").opacity(0).accessibilityHidden(true)
         }
-        .onAppear {
-            model.refresh()
-            model.loadHistory()
-        }
+        .onAppear { model.refresh() }
     }
-
-    private var planned: [Candidate] { model.actions.filter(\.dryRun) }
 
     private func showMoreMenu(_ mood: Mood) {
         let menu = NSMenu()
@@ -370,10 +364,7 @@ struct Notice: View {
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Group {
-                Image(systemName: symbol)
-            }
-            .foregroundStyle(tint)
+            Image(systemName: symbol).foregroundStyle(tint)
             .frame(width: 20)
             VStack(alignment: .leading, spacing: 8) {
                 Text(text).fixedSize(horizontal: false, vertical: true)
@@ -399,46 +390,20 @@ struct LiveLine: View {
         HStack(spacing: 8) {
             if checking {
                 ProgressView().controlSize(.small).frame(width: 20)
-                Text("Checking your disk…")
+                Text("Measuring your folders…")
             } else if let last {
                 Image(systemName: last.failed ? "exclamationmark.circle" : last.acted ? "checkmark.circle.fill" : "checkmark.circle")
                     .foregroundStyle(last.acted ? Color.headroom : .secondary)
                     .frame(width: 20)
-                Text("\(last.text) · \(last.at.formatted(date: .omitted, time: .shortened))")
-                    .lineLimit(2)
-                    .accessibilityLabel("Last check at \(last.at.formatted(date: .omitted, time: .shortened)): \(last.text)")
+                // M10: "2 minutes ago", never a bare "00:30" that reads like a duration.
+                let when = ago(last.at).replacingOccurrences(of: " ", with: "\u{00A0}") // never "1 / second ago"
+                Text("\(last.text) · \(when)").lineLimit(2)
             }
         }
         .font(.callout)
         .foregroundStyle(.secondary)
         .monospacedDigit()
         .accessibilityElement(children: .combine)
-    }
-}
-
-/// The dry run's picks, so the week shows what autopilot would really do.
-struct WouldDoList: View {
-    let rows: [Candidate]
-    let total: Int
-    let seeAll: () -> Void
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("First to go when the dry run ends").font(.subheadline).foregroundStyle(.secondary)
-            ForEach(rows) { r in
-                HStack {
-                    Text(r.name).lineLimit(1)
-                    Text(r.what).foregroundStyle(.secondary).lineLimit(1)
-                    Spacer()
-                    Text(bytes(r.bytes)).monospacedDigit()
-                }
-                .font(.callout)
-                .accessibilityElement(children: .combine)
-            }
-            if total > rows.count {
-                Button("Show All \(total)…", action: seeAll).buttonStyle(.link).font(.callout)
-            }
-        }
     }
 }
 
